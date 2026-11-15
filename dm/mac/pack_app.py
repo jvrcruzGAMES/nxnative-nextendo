@@ -363,6 +363,8 @@ def pack(a):
     if tables: copy(tables, dm, False)
     if pairs: shutil.copyfile(pairs, dm / 'pso_pairs.tsv')   # the split's copy, for a profile without the table
     if fonts: copy(fonts, dm / 'font', False)
+    if getattr(a, 'system', None) and Path(a.system).is_dir():
+        shutil.copytree(a.system, dm / 'system', dirs_exist_ok=True)
     if a.env_file: shutil.copyfile(a.env_file, dm / 'env.txt')
     if a.settings: shutil.copyfile(a.settings, dm / 'launcher.json')
     cid = getattr(a, 'nextendo_client_id', None) or 'nxc_cUHxqMhkXXSA'
@@ -445,6 +447,7 @@ def parse(argv):
     ap.add_argument('--msl-name', help='its folder name in the app (default: its own)')
     ap.add_argument('--tables', required=True, help='the game profile folder (shader_map.tsv and the tables beside it)')
     ap.add_argument('--font', required=True, help='the folder of the shared-font stand-ins (nintendo_ext.ttf)')
+    ap.add_argument('--system', help='the folder of system data (MiiModel sysdata, etc.)')
     ap.add_argument('--aoc', help='the DLC RomFS images or folders by index')
     ap.add_argument('--pso', help='the pipeline archive made offline for this Mac (pso_offline.py --platform macos output: <arch>.mtl4a, prebuilt.tsv)')
     ap.add_argument('--pso-pairs', help='pso_pairs.tsv for a profile that has none (the shader split\'s copy)')

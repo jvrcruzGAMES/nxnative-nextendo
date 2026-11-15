@@ -25,6 +25,7 @@
 #include "pad_apple.h"
 #include "pad_hid_mac.h"
 #include "pad_switch2_apple.h"
+#include "hle_mii.h"
 static int s2pad_player(s2_pad *d);   // the Switch 2 pads' player slots (below, beside the raw HID pads')
 static void s2pad_read(s2_pad *d);
 static void (*g_merge_sink)(const dm_haptic_state *);   // DM_PAD_MERGE: where player 1's rumble goes, the pads last used (merge_rumble_to): NULL for GameController's
@@ -1774,6 +1775,132 @@ void front_error_dialog(const char *code, const char *msg) {
         if (game && a.window.level <= game.level) a.window.level = game.level + 1;
         [a runModal];
     });
+}
+
+// Native Mii editor (front.h): NSAlert with custom accessory view for creating or editing a Mii
+int front_mii_editor(void *charinfo_out, int is_new) {
+    if (!g_layer) return -1;
+    mii_charinfo *c = (mii_charinfo *)charinfo_out;
+    __block int result = 0;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
+        dm_touch_set(NULL, 0);
+
+        NSAlert *a = [NSAlert new];
+        a.alertStyle = NSAlertStyleInformational;
+        a.messageText = is_new ? @"Create Mii" : @"Edit Mii";
+        a.informativeText = @"Configure your Mii character:";
+        [a addButtonWithTitle:@"Save"];
+        [a addButtonWithTitle:@"Cancel"];
+
+        NSView *accessory = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 360, 204)];
+
+        // Nickname
+        NSTextField *nameLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 172, 90, 22)];
+        nameLabel.stringValue = @"Nickname:";
+        nameLabel.editable = NO; nameLabel.bezeled = NO; nameLabel.drawsBackground = NO;
+        [accessory addSubview:nameLabel];
+
+        NSTextField *nameField = [[NSTextField alloc] initWithFrame:NSMakeRect(95, 172, 250, 24)];
+        char current_name[32] = {0};
+        for (int i = 0; i < 10 && c->nickname[i]; i++) current_name[i] = (char)c->nickname[i];
+        nameField.stringValue = current_name[0] ? [NSString stringWithUTF8String:current_name] : @"Player";
+        [accessory addSubview:nameField];
+
+        // Gender
+        NSTextField *genderLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 138, 90, 22)];
+        genderLabel.stringValue = @"Gender:";
+        genderLabel.editable = NO; genderLabel.bezeled = NO; genderLabel.drawsBackground = NO;
+        [accessory addSubview:genderLabel];
+
+        NSSegmentedControl *genderCtrl = [NSSegmentedControl segmentedControlWithLabels:@[@"Male", @"Female"]
+                                                                           trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                                                 target:nil action:nil];
+        genderCtrl.frame = NSMakeRect(95, 138, 160, 24);
+        genderCtrl.selectedSegment = c->gender ? 1 : 0;
+        [accessory addSubview:genderCtrl];
+
+        // Favorite Color
+        NSTextField *colorLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 104, 90, 22)];
+        colorLabel.stringValue = @"Color:";
+        colorLabel.editable = NO; colorLabel.bezeled = NO; colorLabel.drawsBackground = NO;
+        [accessory addSubview:colorLabel];
+
+        NSPopUpButton *colorPop = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(95, 102, 160, 26) pullsDown:NO];
+        NSArray *colorNames = @[@"Red", @"Orange", @"Yellow", @"Lime Green", @"Green", @"Blue", @"Cyan", @"Pink", @"Purple", @"Brown", @"White", @"Black"];
+        [colorPop addItemsWithTitles:colorNames];
+        [colorPop selectItemAtIndex:c->favorite_color < colorNames.count ? c->favorite_color : 0];
+        [accessory addSubview:colorPop];
+
+        // Presets (Guest A - F)
+        NSTextField *presetLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 70, 90, 22)];
+        presetLabel.stringValue = @"Preset:";
+        presetLabel.editable = NO; presetLabel.bezeled = NO; presetLabel.drawsBackground = NO;
+        [accessory addSubview:presetLabel];
+
+        NSPopUpButton *presetPop = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(95, 68, 160, 26) pullsDown:NO];
+        NSArray *presetNames = @[@"Guest A (Male/Green)", @"Guest B (Male/Blue)", @"Guest C (Male/Red)",
+                                 @"Guest D (Female/Yellow)", @"Guest E (Female/Cyan)", @"Guest F (Female/Pink)"];
+        [presetPop addItemsWithTitles:presetNames];
+        [presetPop selectItemAtIndex:0];
+        [accessory addSubview:presetPop];
+
+        // Height & Build Sliders
+        NSTextField *sizeLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 34, 90, 22)];
+        sizeLabel.stringValue = @"Height:";
+        sizeLabel.editable = NO; sizeLabel.bezeled = NO; sizeLabel.drawsBackground = NO;
+        [accessory addSubview:sizeLabel];
+
+        NSSlider *heightSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(95, 34, 160, 22)];
+        heightSlider.minValue = 0; heightSlider.maxValue = 128;
+        heightSlider.intValue = c->height ? c->height : 64;
+        [accessory addSubview:heightSlider];
+
+        NSTextField *buildLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 4, 90, 22)];
+        buildLabel.stringValue = @"Build:";
+        buildLabel.editable = NO; buildLabel.bezeled = NO; buildLabel.drawsBackground = NO;
+        [accessory addSubview:buildLabel];
+
+        NSSlider *buildSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(95, 4, 160, 22)];
+        buildSlider.minValue = 0; buildSlider.maxValue = 128;
+        buildSlider.intValue = c->build ? c->build : 64;
+        [accessory addSubview:buildSlider];
+
+        a.accessoryView = accessory;
+        [a.window setInitialFirstResponder:nameField];
+
+        [NSApp activateIgnoringOtherApps:YES];
+        [a layout];
+        NSWindow *game = g_win;
+        if (game && a.window.level <= game.level) a.window.level = game.level + 1;
+
+        NSModalResponse resp = [a runModal];
+        if (resp == NSAlertFirstButtonReturn) {
+            result = 1;
+            NSString *val = [nameField.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (!val.length) val = @"Player";
+            memset(c->nickname, 0, sizeof(c->nickname));
+            for (NSUInteger i = 0; i < val.length && i < 10; i++) {
+                c->nickname[i] = (uint16_t)[val characterAtIndex:i];
+            }
+            c->gender = (uint8_t)genderCtrl.selectedSegment;
+            c->favorite_color = (uint8_t)colorPop.indexOfSelectedItem;
+            c->height = (uint8_t)heightSlider.intValue;
+            c->build = (uint8_t)buildSlider.intValue;
+
+            NSInteger pidx = presetPop.indexOfSelectedItem;
+            if (pidx >= 0 && pidx < MII_DEFAULTS) {
+                c->hair_type = s_guest_miis[pidx].hair_type;
+                c->hair_color = s_guest_miis[pidx].hair_color;
+                c->eye_type = s_guest_miis[pidx].eye_type;
+                c->eye_color = s_guest_miis[pidx].eye_color;
+                c->eyebrow_type = s_guest_miis[pidx].eyebrow_type;
+                c->eyebrow_color = s_guest_miis[pidx].eyebrow_color;
+                c->faceline_color = s_guest_miis[pidx].faceline_color;
+            }
+        }
+    });
+    return result;
 }
 
 // GPU lost (front.h): macOS runs none of the game's GPU work any more and nothing is drawn again. In full screen the frozen game held the whole screen (#1326: WindowServer froze for 40 s

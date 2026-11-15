@@ -10,6 +10,7 @@
 #include <errno.h>
 #include "front.h"
 #include "hle.h"
+#include "hle_mii.h"
 #include "dm.h"
 #include "haptics_apple.h"
 #include "save_sync.h"
@@ -505,6 +506,93 @@ void front_error_dialog(const char *code, const char *msg) {
         [vc presentViewController:a animated:YES completion:nil];
     });
     dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+}
+
+// Native Mii editor (front.h): UIAlertController with nickname and style presets
+int front_mii_editor(void *charinfo_out, int is_new) {
+    if (!g_layer) return -1;
+    mii_charinfo *c = (mii_charinfo *)charinfo_out;
+    __block int result = 0;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *vc = nil;
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if ([s isKindOfClass:UIWindowScene.class]) {
+                for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                    if (w.isKeyWindow) vc = w.rootViewController;
+                }
+            }
+        }
+        while (vc.presentedViewController) vc = vc.presentedViewController;
+        if (!vc) {
+            dispatch_semaphore_signal(done);
+            return;
+        }
+
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:is_new ? @"Create Mii" : @"Edit Mii"
+                                                                    message:@"Enter a nickname and choose your style:"
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+
+        char cur_name[32] = {0};
+        for (int i = 0; i < 10 && c->nickname[i]; i++) cur_name[i] = (char)c->nickname[i];
+        NSString *initial_name = cur_name[0] ? [NSString stringWithUTF8String:cur_name] : @"Player";
+
+        [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.placeholder = @"Nickname (up to 10 characters)";
+            tf.text = initial_name;
+            tf.autocapitalizationType = UITextAutocapitalizationTypeWords;
+        }];
+
+        NSArray *presetNames = @[
+            @"Guest A (Male / Green)",
+            @"Guest B (Male / Blue)",
+            @"Guest C (Male / Red)",
+            @"Guest D (Female / Yellow)",
+            @"Guest E (Female / Cyan)",
+            @"Guest F (Female / Pink)"
+        ];
+
+        for (NSInteger i = 0; i < (NSInteger)presetNames.count; i++) {
+            NSInteger idx = i;
+            NSString *label = [NSString stringWithFormat:@"Save: %@", presetNames[i]];
+            [ac addAction:[UIAlertAction actionWithTitle:label style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+                (void)action;
+                result = 1;
+                UITextField *tf = ac.textFields.firstObject;
+                NSString *name = [tf.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (!name.length) name = @"Player";
+                memset(c->nickname, 0, sizeof(c->nickname));
+                for (NSUInteger k = 0; k < name.length && k < 10; k++) {
+                    c->nickname[k] = (uint16_t)[name characterAtIndex:k];
+                }
+                c->gender = s_guest_miis[idx].gender;
+                c->favorite_color = s_guest_miis[idx].favorite_color;
+                c->faceline_color = s_guest_miis[idx].faceline_color;
+                c->hair_type = s_guest_miis[idx].hair_type;
+                c->hair_color = s_guest_miis[idx].hair_color;
+                c->eye_type = s_guest_miis[idx].eye_type;
+                c->eye_color = s_guest_miis[idx].eye_color;
+                c->eyebrow_type = s_guest_miis[idx].eyebrow_type;
+                c->eyebrow_color = s_guest_miis[idx].eyebrow_color;
+                c->nose_type = s_guest_miis[idx].nose_type;
+                c->mouth_type = s_guest_miis[idx].mouth_type;
+                c->height = 64; c->build = 64;
+                dispatch_semaphore_signal(done);
+            }]];
+        }
+
+        [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+            (void)action;
+            result = 0;
+            dispatch_semaphore_signal(done);
+        }]];
+
+        [vc presentViewController:ac animated:YES completion:nil];
+    });
+
+    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    return result;
 }
 
 // Save write failed (most likely the phone's storage is full): show a notice on the main thread without blocking the game. hle_fs.c calls this when a save transaction is refused or a mount has to fall back to read-only;

@@ -7,29 +7,16 @@
 // the Switch's common colour indices (hair 1, eyes 8, mouth 19, glasses 8), a create ID of UUID version 4 (fixed for each default Mii, fresh for a random one) and the nickname "no name";
 // every field is within CharInfoRaw::Verify's ranges (SDK 4.4.0 sdk+0x1b68c8), so CharInfoAccessor::IsValid accepts it.
 #include "hle.h"
+#include "hle_mii.h"
+#include "front.h"
 #include <sys/stat.h>
 #include <unistd.h>
 
 uint64_t dm_entropy64(void);
 
-#define MII_RES_NOT_FOUND 0x87Eu        // nn::mii module 126, description 4
-#define MII_RES_CANCELED 0xE7Eu         // description 7: the player closed the applet (the SDK's ShowMiiEdit treats it as success)
-#define MII_RES_TEST_MODE 0x1987Eu      // description 204: importing a database needs the system's test mode
-
-typedef struct __attribute__((packed)) {
-    uint8_t create_id[16]; uint16_t nickname[11];
-    uint8_t font_region, favorite_color, gender, height, build, type, region_move;
-    uint8_t faceline_type, faceline_color, faceline_wrinkle, faceline_make;
-    uint8_t hair_type, hair_color, hair_flip;
-    uint8_t eye_type, eye_color, eye_scale, eye_aspect, eye_rotate, eye_x, eye_y;
-    uint8_t eyebrow_type, eyebrow_color, eyebrow_scale, eyebrow_aspect, eyebrow_rotate, eyebrow_x, eyebrow_y;
-    uint8_t nose_type, nose_scale, nose_y;
-    uint8_t mouth_type, mouth_color, mouth_scale, mouth_aspect, mouth_y;
-    uint8_t beard_color, beard_type, mustache_type, mustache_scale, mustache_y;
-    uint8_t glass_type, glass_color, glass_scale, glass_y;
-    uint8_t mole_type, mole_scale, mole_x, mole_y, reserved;
-} mii_charinfo;
-_Static_assert(sizeof(mii_charinfo) == 0x58, "nn::mii::CharInfo is 0x58 bytes");
+__attribute__((weak)) int front_mii_editor(void *charinfo_out, int is_new) {
+    (void)charinfo_out; (void)is_new; return -1;
+}
 
 // index ≥ 0: default Mii <index> (a fixed create ID, so a game that saved one finds the same Mii again); < 0: a random Mii (a fresh one)
 static void mii_default(mii_charinfo *c, int gender, int index) {
@@ -37,15 +24,35 @@ static void mii_default(mii_charinfo *c, int gender, int index) {
     uint64_t a = index >= 0 ? 0x4d49494e44454641ull + (uint64_t)index : dm_entropy64(), b = index >= 0 ? 0x554c54444d484f53ull : dm_entropy64();
     memcpy(c->create_id, &a, 8); memcpy(c->create_id + 8, &b, 8);
     c->create_id[6] = (uint8_t)((c->create_id[6] & 0x0f) | 0x40); c->create_id[8] = (uint8_t)((c->create_id[8] & 0x3f) | 0x80);
-    if (index >= 0) c->favorite_color = (uint8_t)(index * 2);   // red, yellow, green, sky blue, purple, white
-    static const char name[] = "no name";
-    for (size_t i = 0; i < sizeof name - 1; i++) c->nickname[i] = (uint16_t)name[i];
-    c->gender = gender == 1; c->height = 64; c->build = 64;
-    c->hair_type = 33; c->hair_color = 1;
-    c->eye_type = 2; c->eye_color = 8; c->eye_scale = 4; c->eye_aspect = 3; c->eye_rotate = 4; c->eye_x = 2; c->eye_y = 12;
-    c->eyebrow_type = 6; c->eyebrow_color = 1; c->eyebrow_scale = 4; c->eyebrow_aspect = 3; c->eyebrow_rotate = 6; c->eyebrow_x = 2; c->eyebrow_y = 10;
-    c->nose_type = 1; c->nose_scale = 4; c->nose_y = 9;
-    c->mouth_type = 23; c->mouth_color = 19; c->mouth_scale = 4; c->mouth_aspect = 3; c->mouth_y = 13;
+
+    const mii_guest_preset *p = NULL;
+    if (index >= 0 && index < MII_DEFAULTS) {
+        p = &s_guest_miis[index];
+    } else {
+        int pick = (gender == 1) ? (3 + (int)(dm_entropy64() % 3)) : ((gender == 0) ? (int)(dm_entropy64() % 3) : (int)(dm_entropy64() % MII_DEFAULTS));
+        p = &s_guest_miis[pick];
+    }
+
+    c->gender = p->gender;
+    c->favorite_color = p->favorite_color;
+    c->faceline_color = p->faceline_color;
+    c->hair_type = (index < 0) ? (uint8_t)(dm_entropy64() % 132) : p->hair_type;
+    c->hair_color = p->hair_color;
+    c->eye_type = p->eye_type;
+    c->eye_color = p->eye_color;
+    c->eyebrow_type = p->eyebrow_type;
+    c->eyebrow_color = p->eyebrow_color;
+    c->nose_type = p->nose_type;
+    c->mouth_type = p->mouth_type;
+
+    const char *name = (index >= 0) ? p->name : "no name";
+    for (size_t i = 0; i < 10 && name[i]; i++) c->nickname[i] = (uint16_t)name[i];
+
+    c->height = 64; c->build = 64;
+    c->eye_scale = 4; c->eye_aspect = 3; c->eye_rotate = 4; c->eye_x = 2; c->eye_y = 12;
+    c->eyebrow_scale = 4; c->eyebrow_aspect = 3; c->eyebrow_rotate = 6; c->eyebrow_x = 2; c->eyebrow_y = 10;
+    c->nose_scale = 4; c->nose_y = 9;
+    c->mouth_color = 19; c->mouth_scale = 4; c->mouth_aspect = 3; c->mouth_y = 13;
     c->beard_color = 8; c->mustache_scale = 4; c->mustache_y = 10;
     c->glass_color = 8; c->glass_scale = 4; c->glass_y = 10;
     c->mole_scale = 4; c->mole_x = 2; c->mole_y = 20;
@@ -151,7 +158,6 @@ HLE_FORCE("_ZN2nn3mii8Database9IsUpdatedEi", "mii:u service; true once after App
 HLE_FORCE("_ZNK2nn3mii8Database14IsFullDatabaseEv", "mii:u service; full at 100 Miis", int, h_mii_Full, const void *self) { (void)self; return g_mii_n >= MII_DB_MAX; }
 // Source flags: 1 the console's database, 2 the six default Miis every console has; the database's come first, as the mii service lists them. Mario Kart 8 Deluxe asks for the defaults with room for 6 and never reads the count
 // (main+0x81e954): its boot-time list of Mii icons (main+0x419dc8) builds a head for each of the six, and zeroed entries failed the model's CharInfo check
-enum { MII_SRC_DATABASE = 1, MII_SRC_DEFAULT = 2, MII_DEFAULTS = 6 };
 static int mii_get(void *buf, int n, int src, size_t stride) {
     int k = 0; pthread_mutex_lock(&g_mii_mu);
     for (int i = 0; (src & MII_SRC_DATABASE) && buf && k < n && i < g_mii_n; i++, k++) {
@@ -274,18 +280,68 @@ int dm_mii_standin(const char *dir) {
     return ok;
 }
 
-// The Mii editor (MiiEdit library applet). AppendMii opens it to make a new Mii: the host answers as a player who saves the editor's starting Mii, the system's default one (male,
-// "no name") with a create ID of its own, added to the database and kept in the host's file (mii_host_save); *index is its place in the database. Mario Golf: Super Rush's Golf
-// Adventure asks for one when the database holds none, and went back to its save slots at a cancel (issue #2361). A full database cancels, as the editor cannot add one then
-HLE_FORCE("_ZN2nn3mii9AppendMiiEPi", "MiiEdit applet; the default Mii is made and added", Result, h_mii_Append, int *index) {
+// The Mii editor (MiiEdit library applet). AppendMii opens it to create a Mii: front_mii_editor shows the native
+// UI, and saving adds it to the database and keeps it in the host's file (mii_host_save); *index is its place in the database.
+// Headless runs (front_mii_editor returning -1) save the default Mii directly. A full database cancels, as the editor cannot add one then
+HLE_FORCE("_ZN2nn3mii9AppendMiiEPi", "MiiEdit applet; create Mii and add to database", Result, h_mii_Append, int *index) {
     DM_APPLET("Mii editor"); mii_db_once();
     pthread_mutex_lock(&g_mii_mu);
     if (g_mii_n >= MII_DB_MAX) { pthread_mutex_unlock(&g_mii_mu); LOG("mii: AppendMii: the database is full (cancelled)"); return MII_RES_CANCELED; }
-    int i = g_mii_n++; mii_default(&g_mii_db[i], 0, -1); g_mii_changed = 1;
+    pthread_mutex_unlock(&g_mii_mu);
+
+    mii_charinfo new_mii;
+    mii_default(&new_mii, 0, -1);
+
+    int saved = front_mii_editor(&new_mii, 1);
+    if (saved == 0) {
+        LOG("mii: AppendMii: cancelled by player");
+        return MII_RES_CANCELED;
+    }
+
+    pthread_mutex_lock(&g_mii_mu);
+    if (g_mii_n >= MII_DB_MAX) { pthread_mutex_unlock(&g_mii_mu); LOG("mii: AppendMii: database became full"); return MII_RES_CANCELED; }
+    int i = g_mii_n++;
+    memcpy(&g_mii_db[i], &new_mii, sizeof(mii_charinfo));
+    g_mii_changed = 1;
     int kept = mii_host_save();
     pthread_mutex_unlock(&g_mii_mu);
     if (index) *index = i;
-    LOG("mii: AppendMii: the default Mii is added as database entry %d%s", i, kept ? "" : " (this run only)");
+    LOG("mii: AppendMii: Mii is added as database entry %d%s", i, kept ? "" : " (this run only)");
     return RES_OK;
 }
-HLE_FORCE("_ZN2nn3mii11ShowMiiEditEv", "MiiEdit applet; closed at once", Result, h_mii_Edit, void) { DM_APPLET("Mii editor"); LOG("mii: ShowMiiEdit (the host has no Mii editor)"); return RES_OK; }
+HLE_FORCE("_ZN2nn3mii11ShowMiiEditEv", "MiiEdit applet; show native Mii editor", Result, h_mii_Edit, void) {
+    DM_APPLET("Mii editor"); mii_db_once();
+    pthread_mutex_lock(&g_mii_mu);
+    if (g_mii_n > 0) {
+        int target = g_mii_n - 1;
+        mii_charinfo edit_mii = g_mii_db[target];
+        pthread_mutex_unlock(&g_mii_mu);
+
+        int saved = front_mii_editor(&edit_mii, 0);
+        if (saved == 1) {
+            pthread_mutex_lock(&g_mii_mu);
+            memcpy(&g_mii_db[target], &edit_mii, sizeof(mii_charinfo));
+            g_mii_changed = 1;
+            mii_host_save();
+            pthread_mutex_unlock(&g_mii_mu);
+            LOG("mii: ShowMiiEdit: updated Mii entry %d", target);
+        }
+    } else {
+        pthread_mutex_unlock(&g_mii_mu);
+        mii_charinfo new_mii;
+        mii_default(&new_mii, 0, -1);
+        int saved = front_mii_editor(&new_mii, 1);
+        if (saved == 1) {
+            pthread_mutex_lock(&g_mii_mu);
+            if (g_mii_n < MII_DB_MAX) {
+                int i = g_mii_n++;
+                memcpy(&g_mii_db[i], &new_mii, sizeof(mii_charinfo));
+                g_mii_changed = 1;
+                mii_host_save();
+                LOG("mii: ShowMiiEdit: created Mii entry %d", i);
+            }
+            pthread_mutex_unlock(&g_mii_mu);
+        }
+    }
+    return RES_OK;
+}

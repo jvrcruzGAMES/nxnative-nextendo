@@ -52,6 +52,13 @@ int front_ctrl_support(int min, int max);
 // With no window or headless, the default weak implementation logs and returns immediately.
 void front_error_dialog(const char *code, const char *msg);
 
+// Native Mii editor (called by MiiEdit applet / nn::mii; hle_mii.c):
+// Shows native macOS / iOS UI to configure or edit a Mii character.
+// charinfo_out: pointer to mii_charinfo to read and populate.
+// is_new: 1 if creating a new Mii (AppendMii), 0 if editing an existing Mii (ShowMiiEdit).
+// Returns 1 if saved, 0 if cancelled, -1 if no window / unsupported (headless).
+int front_mii_editor(void *charinfo_out, int is_new);
+
 // Early start of host loading (main.c): reading the NSO / relocation / forced takeover / prefetch start are moved to a background thread, in parallel with the front end (UIKit launch chain, Metal view);
 // the dm_main / main called afterwards waits for it to finish. For call timing and preconditions see the comments in main.c (set DM_ROMFS and the other environment variables and the cwd first; arguments identical item by item to those of the later main).
 void dm_host_preload_start(int argc, char **argv);

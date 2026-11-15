@@ -85,6 +85,7 @@ SHOW_FPS = True                         # True shows the game's frame rate on th
 NEXTENDO_CLIENT_ID = 'nxc_cUHxqMhkXXSA'  # Nextendo client ID (hardcoded)
 NEXTENDO_SERVER_IP = '51.178.29.194'     # Nextendo server IP
 NEXTENDO_NAT_IP = '164.132.111.120'      # Nextendo NAT server IP
+FIRMWARE = ''                            # path to a Nintendo Switch Firmware.zip or directory of firmware NCAs to extract system data (MiiModel, SharedFont, MiiEdit)
 MOTION = True                           # True passes a gyro controller's motion (on iOS also the phone's own) to games that read it; False builds with DM_MOTION=0, for when motion misbehaves (DM_MOTION=1 in the app's Documents/env.txt turns it back on without a rebuild)
 SURVEY_ONLY = False                     # a game with no profile in dm/games: only write the survey, no provisional profile and no IPA
 PROFILE_OUT = ''                        # where a provisional profile goes (empty = <build folder>/profile, i.e. <NSP folder>/<title ID>_build/profile unless WORK_DIR is set; the profile is <this>/<title ID>/)
@@ -2757,13 +2758,16 @@ def build_env_file(work, env_file, motion):
     return str(f)
 
 
-def mac_host(py, repo, work, env, logs, g):
+def mac_host(py, repo, work, env, logs, g, fw_font=None):
     """The stage "Mac host" of a Mac-only build or a Mac app (PLATFORM 'mac', 'mac-app'): the Mac host for the profile (build_mac_host, into <id>_build/tools/dmhost, where the run-time captures
     build it too; DM_GAMES_DIR / DM_GAMES_FIRST in env pick a provisional or derived profile) and the button-icon font the host gives a game for the Nintendo extension shared font
     and the shared-font stand-ins (make_shared_fonts.py: one per type, into <id>_build/font, made again when the tools or the source font changed). Returns (host, font folder)"""
     PROG.stage('Mac host', step='building')
     host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
     PROG.set(step='shared fonts')
+    if fw_font and (Path(fw_font) / 'standard.ttf').is_file():
+        PROG.end(str(host))
+        return host, Path(fw_font)
     font, kf = work / 'font', work / 'font.key'
     src = Path(os.environ.get('STD_FONT') or '/System/Library/Fonts/Supplemental/Arial Unicode.ttf')
     st = src.stat() if src.is_file() else None
@@ -3031,7 +3035,7 @@ def mac_app_name(name):   # the app's file name: the game name with the characte
     return re.sub(r'\s*[:/]\s*', ' - ', name).strip(' .-') or 'nxnative'
 
 
-def mac_app(py, repo, out, app, work, game, patched, host, font, msl, aoc, gfx, lang, g, name, version, bundle_id, icon, sign, env, logs, env_file='', gpus='', programs=None, control=None, prebake=False, nextendo_client_id=NEXTENDO_CLIENT_ID, nextendo_server_ip=NEXTENDO_SERVER_IP, nextendo_nat_ip=NEXTENDO_NAT_IP):
+def mac_app(py, repo, out, app, work, game, patched, host, font, msl, aoc, gfx, lang, g, name, version, bundle_id, icon, sign, env, logs, env_file='', gpus='', programs=None, control=None, prebake=False, nextendo_client_id=NEXTENDO_CLIENT_ID, nextendo_server_ip=NEXTENDO_SERVER_IP, nextendo_nat_ip=NEXTENDO_NAT_IP, system=None):
     """The last stage of PLATFORM 'mac-app': pack the Mac app (dm/mac/pack_app.py) from what a Mac-only build made: the Mac host and font (mac_host), the packed version's RomFS and rewritten
     modules, the Mac shader libraries (msl: <shader>/cache, whose b-<chain> goes in, or a Vulkan or GL game's <shader>, whose vk / gl goes in), the DLC, the profile's tables (with the shader pairs
     the pipeline prebuild reads), the pipeline archive made offline for this Mac (mac_pso; gpus: --gpu / PSO_GPUS), the launcher settings and an environment file.
@@ -3050,6 +3054,8 @@ def mac_app(py, repo, out, app, work, game, patched, host, font, msl, aoc, gfx, 
     cmd = [py, repo / 'dm/mac/pack_app.py', out, '--host', host, '--patched', patched, '--romfs', rfs.source(game), '--msl', lib, '--tables', g.table('shader_map.tsv').parent,
            '--font', font, '--title-id', f'{app:016X}', '--name', name, '--bundle-id', bundle_id, '--lang', lang, '--sign', sign or '-']
     cmd += ['--nextendo-client-id', nextendo_client_id, '--nextendo-server-ip', nextendo_server_ip, '--nextendo-nat-ip', nextendo_nat_ip]
+    if system and Path(system).is_dir():
+        cmd += ['--system', str(system)]
     split_pairs = work / 'shader/pso_pairs.tsv'   # the split's copy of pso_pairs.tsv, for a profile without the table (as mac_run's DM_PSO_PAIRS)
     for opt, v in (('--version', version), ('--category', g.get('app_category')), ('--marker', g.get('romfs_marker')), ('--aoc', aoc), ('--icon', icon),
                    ('--pso', pso), ('--pso-pairs', split_pairs if gfx == 'nvn' and not g.table('pso_pairs.tsv').is_file() and split_pairs.is_file() else None),
@@ -3119,6 +3125,7 @@ def parse_args(argv):
     ap.add_argument('--nextendo-client-id', default=NEXTENDO_CLIENT_ID, help='Nextendo client ID (default: nxc_cUHxqMhkXXSA)')
     ap.add_argument('--nextendo-server-ip', default=NEXTENDO_SERVER_IP, help='Nextendo server IP (default: 51.178.29.194)')
     ap.add_argument('--nextendo-nat-ip', default=NEXTENDO_NAT_IP, help='Nextendo NAT server IP (default: 164.132.111.120)')
+    ap.add_argument('--firmware', default=FIRMWARE, help='path to a Nintendo Switch Firmware.zip or directory of firmware NCAs to extract system data (MiiModel, SharedFont, MiiEdit)')
     ap.add_argument('--motion', action=argparse.BooleanOptionalAction, help='pass a gyro controller\'s motion (on iOS also the phone\'s own) to games that read it; --no-motion builds with DM_MOTION=0, for when motion misbehaves (default: the MOTION setting, on)')
     ap.add_argument('--survey-only', action='store_true', help='a game with no profile: only the survey, no provisional profile and no IPA')
     ap.add_argument('--program', type=int, default=None, help='a multi-program application (Super Mario 3D All-Stars): pack program N of the NSPs as a game of its own, title ID = the application\'s + N (default: the PROGRAM_INDEX setting, 0; a game whose profile lists programs packs them all as one from program 0: this is for bring-up)')
@@ -3359,6 +3366,20 @@ def main(args=None):
     env.update(DM_GAME=g.id, DM_ROOT=str(work), WORK=str(work / 'tmp'))
     logs = work / 'logs'
     check_prereqs(env, xlate, mac)
+
+    fw_arg = args.firmware if args and args.firmware else FIRMWARE
+    fw_sys = None
+    if fw_arg:
+        fw_path = Path(os.path.expanduser(fw_arg)).resolve()
+        if not fw_path.exists():
+            raise BuildError(f'firmware path not found: {fw_path}')
+        fw_sys = work / 'system'
+        PROG.stage('firmware', step='extracting')
+        fw_log = logs / 'fw_extract.log'
+        run(['dotnet', 'run', '--project', str(repo / 'dm/tools/fw_extract/fw_extract.csproj'), '--', str(keys), str(fw_path), str(fw_sys)], fw_log, env=env)
+        PROG.end(f'{fw_path.name}')
+        say(f'firmware system data: extracted to {fw_sys}')
+
     picks = pick_nsps(fam, have, versions)
 
     ex = work / 'extract'; ex.mkdir(parents=True, exist_ok=True); (work / 'tmp').mkdir(exist_ok=True)
@@ -3481,12 +3502,14 @@ def main(args=None):
     if mac_pack:   # a Mac app: the Mac host, then the app packed from it and the build's files
         if getattr(args, 'in_programs', None) is not None:   # a program of the game: the app its first program's build packs takes these
             rmtree(work / 'tmp'); return {'patched': patched, 'romfs': rfs.source(game), 'msl': ios / (f'b-{chain_of(repo)}' if gfx == 'nvn' else 'vk' if gfx == 'vulkan' else 'gl'), 'tables': g.table('shader_map.tsv').parent, 'html': game / 'html', 'gfx': gfx}
-        host, font = mac_host(py, repo, work, env, logs, g)
+        fw_font = (fw_sys / 'font') if fw_sys and (fw_sys / 'font/standard.ttf').is_file() else None
+        host, font = mac_host(py, repo, work, env, logs, g, fw_font=fw_font)
         programs = other_programs(args, g)
         if not icon: say(('no game icon: the NUP carries none' if nup else 'no game icon: a dump folder has no control data') + '; the app\'s icon will be blank; --icon / ICON or --fallback-icon / FALLBACK_ICON gives it one' if dump else '[RED] no game icon in the extraction (an older extraction did not save it: delete extract/ and run again); the app\'s icon will be blank')
         mac_app(py, repo, out_ipa, app, work, game, patched, host, font, ios, aoc, gfx, lang, g, app_name, app_version, bundle_id, icon, args.mac_sign or MAC_SIGN, env, logs, env_file,
                 (args.gpu or PSO_GPUS).strip(), programs, control, PREBAKE if args.prebake is None else args.prebake,
-                nextendo_client_id=nextendo_client_id, nextendo_server_ip=nextendo_server_ip, nextendo_nat_ip=nextendo_nat_ip)
+                nextendo_client_id=nextendo_client_id, nextendo_server_ip=nextendo_server_ip, nextendo_nat_ip=nextendo_nat_ip,
+                system=fw_sys if fw_sys and fw_sys.is_dir() else None)
         rmtree(work / 'tmp')
         say(f'done: {out_ipa} ({tree_size(out_ipa)[1] / 2**30:.1f} GB); '
             f'open it from Finder. Its save is in ~/Library/Application Support/nxnative/{app:016X}/, its log in ~/Library/Logs/nxnative/{app:016X}.log')
@@ -3495,8 +3518,11 @@ def main(args=None):
         return
     if mac:   # a Mac-only build ends with the Mac host and the command that runs the game
         first = getattr(args, 'in_programs', None)   # a program packed with the application's first: its host, built over all of them, and its fonts
-        host, font = (first['host'], first['font']) if first else mac_host(py, repo, work, env, logs, g)
+        fw_font = (fw_sys / 'font') if fw_sys and (fw_sys / 'font/standard.ttf').is_file() else None
+        host, font = (first['host'], first['font']) if first else mac_host(py, repo, work, env, logs, g, fw_font=fw_font)
         parts = {'font': font}
+        if fw_sys and fw_sys.is_dir():
+            env['DM_SYSTEM_DIR'] = str(fw_sys)
         cmd = mac_run(work, game, patched, host, font, ios, aoc, gfx, lang, env, logs, g, env_file, partial=seen_shaders, parts=parts, jit=jit,
                       nextendo_client_id=nextendo_client_id, nextendo_server_ip=nextendo_server_ip, nextendo_nat_ip=nextendo_nat_ip)
         rmtree(work / 'tmp')
@@ -3520,6 +3546,10 @@ def main(args=None):
     ipa_env['NEXTENDO_SERVER_IP'] = nextendo_server_ip
     ipa_env['NEXTENDO_NAT_IP'] = nextendo_nat_ip
     say(f'Nextendo Network: online integration active (client: {nextendo_client_id})')
+    if fw_sys and fw_sys.is_dir():
+        ipa_env['SYSTEM_DIR'] = str(fw_sys)
+        if (fw_sys / 'font/standard.ttf').is_file():
+            ipa_env['FONT_DIR'] = str(fw_sys / 'font')
     if prepare_xcode: ipa_env['DM_XCODE_PROJECT_DIR'] = str(project.parent)
     separate = romfs_mode == 'separate'
     if separate: ipa_env['DM_COPY_ROMFS'] = 'NO'; say('game files: separate (DM_COPY_ROMFS=NO), left out of the app; the image stays at ' + str(rfs.source(game)))

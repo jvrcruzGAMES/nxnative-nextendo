@@ -83,6 +83,8 @@ python3 -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; 
 python3 scripts/build_ipa_from_nsp.py ~/Games/MarioWonder -k ~/keys/prod.keys
 ```
 
+Optionally supply Switch firmware with `--firmware ~/keys/Firmware.zip` to extract authentic system data, 3D Mii models, and shared system fonts into the bundle.
+
 The IPA appears in the game's folder. The first build takes 30–60 minutes and needs free disk space of about twice the game's size plus 10 GB; building again is much faster.
 
 To play on the Mac instead, add `--platform mac-app`: you get a Mac app of the game to open from Finder. All options: [The packing script in detail](docs/development.md#the-packing-script-in-detail).
@@ -140,6 +142,8 @@ This fork adds full, native integration with the [Nextendo Network](https://next
   - TLS sessions automatically negotiate ALPN (`h2`/`http/1.1`) and match target servers.
   - BAAS authentication tokens (RS256 JWTs) are dynamically generated locally using Apple's Security framework to authenticate sessions with Nextendo services.
 - **Native Error Applet UI**: When games encounter network or connectivity issues, error codes (e.g. `2XXX-YYYY`) are presented using native modal dialogs (`UIAlertController` on iOS and `NSAlert` on macOS), ensuring players receive clear visual feedback.
+- **Authentic Built-in Miis & Native Mii Editor**: Fully implements the 6 canonical Nintendo Switch guest presets (Guest A through Guest F) for games with Mii support (such as Mario Kart 8 Deluxe). When a game invokes the system Mii applet (`MiiEdit` / `nn::mii`), nxnative launches a native modal editor (`NSAlert` on macOS, `UIAlertController` on iOS) to customize nicknames, gender, colors, and presets synchronously.
+- **Firmware Integration**: Supports packaging official Switch `Firmware.zip` archives directly via `--firmware`. Extracts system data (`MiiModel` 3D meshes and textures) and decodes shared system fonts (`standard.ttf`, `nintendo_ext.ttf`) into the application bundle for 100% authentic rendering.
 
 See [Nextendo Network in Development](docs/development.md#nextendo-network) for architectural and implementation details.
 
