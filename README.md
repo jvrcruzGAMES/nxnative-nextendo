@@ -1,8 +1,10 @@
-# nxnative
+# nxnative (Nextendo Edition)
 
-Play your own Nintendo Switch and Switch 2 games natively on Apple silicon Macs, iPhone and iPad. One script packs your game into a Mac app or an unsigned IPA that you sideload.
+Play your own Nintendo Switch and Switch 2 games natively on Apple silicon Macs, iPhone and iPad, with online multiplayer powered by the **Nextendo Network**. One script packs your game into a Mac app or an unsigned IPA that you sideload.
 
 It is not an emulator: the game's own code runs directly on the Apple chip, with Switch graphics rebuilt on Metal. Nothing from any game is in this repository, and the project is not affiliated with Nintendo or any game publisher.
+
+> **About this fork**: `nxnative-nextendo` extends upstream nxnative with native online play and network service integration for [Nextendo Network](https://nextendo.network). It routes game network traffic through Nextendo servers via Darwin BSD sockets and TLS interception, integrates seamless in-app OAuth login with Apple Keychain token persistence, implements native modal UI for system Error Applets, and answers Horizon account and network service requests dynamically without requiring external proxy scripts.
 
 [Games](#games) · [Community front ends](#community-front-ends) · [Requirements](#requirements) · [How to play](#how-to-play) · [Nextendo Network](#nextendo-network) · [Discussions](#discussions) · [For developers](#for-developers)
 
@@ -126,9 +128,20 @@ An update's folder alone will do (no `base/`), and so will `exefs/` and `romfs/`
 
 ## Nextendo Network
 
-nxnative includes built-in support for connecting to the [Nextendo Network](https://nextendo.network) for online multiplayer and services.
+This fork adds full, native integration with the [Nextendo Network](https://nextendo.network), an alternative game server replacement for Nintendo Switch games.
 
-To link your Nextendo account, click **Log In with Nextendo** directly on the launcher settings screen before starting the game. The app securely stores your OAuth token in Apple Keychain. Nextendo features are active automatically whenever you are logged in. See [Nextendo Network](docs/development.md#nextendo-network) for details.
+### Purpose and Features of this Fork
+
+- **Native Online Play**: Enables multiplayer matchmaking, rankings, lobbies, and online services on Apple silicon Macs and iOS devices without requiring emulators or external proxy setups.
+- **In-App Authentication**: Log in once with your Nextendo account directly from the game launcher on macOS or iOS. nxnative starts a local loopback listener to handle the OAuth 2.0 authorization callback and securely stores your token in Apple Keychain.
+- **Seamless Service Redirection**: Horizon OS networking calls (`bsd`, `nifm`, `ssl`, `account`) are redirected in the native host runtime to Nextendo's infrastructure:
+  - Game DNS queries to Nintendo servers (`*.srv.nintendo.net`, `accounts.nintendo.com`, etc.) resolve to Nextendo backend endpoints.
+  - Native BSD socket implementation bridges guest TCP/UDP traffic directly to macOS/iOS network interfaces.
+  - TLS sessions automatically negotiate ALPN (`h2`/`http/1.1`) and match target servers.
+  - BAAS authentication tokens (RS256 JWTs) are dynamically generated locally using Apple's Security framework to authenticate sessions with Nextendo services.
+- **Native Error Applet UI**: When games encounter network or connectivity issues, error codes (e.g. `2XXX-YYYY`) are presented using native modal dialogs (`UIAlertController` on iOS and `NSAlert` on macOS), ensuring players receive clear visual feedback.
+
+See [Nextendo Network in Development](docs/development.md#nextendo-network) for architectural and implementation details.
 
 ## Discussions
 

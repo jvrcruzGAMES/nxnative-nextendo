@@ -17,7 +17,15 @@ The README covers packing and playing. This page is for working on nxnative itse
 
 ## Nextendo Network
 
-nxnative connects to the [Nextendo Network](https://nextendo.network) for online multiplayer and Nintendo Network replacement services.
+This fork (`nxnative-nextendo`) adds native online multiplayer and custom network service capabilities to nxnative by connecting directly to the [Nextendo Network](https://nextendo.network).
+
+### Purpose of this Fork
+
+Upstream nxnative runs Switch titles completely offline, stubbing network service calls (`bsd`, `nifm`, `ssl`, `account`) to return disconnected or offline results. The purpose of this fork is to:
+- Restore full online multiplayer and network features for supported titles on Apple silicon (macOS and iOS).
+- Provide seamless authentication via Nextendo OAuth with Apple Keychain storage, requiring no manual token extraction or command-line credentials.
+- Bridge Horizon network services directly to host BSD sockets and Nextendo servers with automated DNS redirection, TLS interception, and local BAAS authentication token generation.
+- Implement native user-facing system applets (such as modal Error Applets on iOS and macOS) so network errors and status messages are clearly communicated to the player.
 
 ### Setup and Authentication
 
@@ -27,10 +35,12 @@ nxnative connects to the [Nextendo Network](https://nextendo.network) for online
 
 ### Architecture
 
-- **Host BSD Sockets**: Sockets created via Switch `bsd:u` / `bsd:s` (`dm_sk_socket`) route to real host Darwin sockets for TCP and non-loopback UDP when Nextendo is enabled (`dm/host/hle_net.c`), while preserving local in-process loopback routing for internal services.
+- **Host BSD Sockets**: Sockets created via Switch `bsd:u` / `bsd:s` (`dm_sk_socket`) route to real host Darwin sockets for TCP and non-loopback UDP when Nextendo is enabled (`dm/host/hle_net.c`), while preserving local in-process loopback routing for internal services. C socket APIs and older SDK overloads (`nnsocketAccept`, `nnsocketListen`, `nnsocketGetAddrInfo`, etc.) are hooked in `dm/host/hle_offline.c` to route through the same host BSD socket layer.
 - **DNS Redirection**: Nintendo service domains (`*.srv.nintendo.net`, `accounts.nintendo.com`, etc.) are intercepted in `getaddrinfo` and redirected to Nextendo servers (`51.178.29.194` and NAT `164.132.111.120`).
 - **TLS Interception**: SecureTransport (`SSLContextRef`) manages guest TLS sessions (`nn::ssl` and `nssl`). The host records the original host header via SNI recovery (`nextendo_last_host_for_ip`), negotiates ALPN (`h2` for `npln` and `http/1.1` for standard HTTP services), and bypasses certificate verification for Nextendo internal domains.
 - **BAAS Token Generation**: `dm/host/hle_nextendo.m` dynamically generates RS256 JWT ID tokens using Apple `Security.framework` (`SecKeyCreateRandomKey` and `SecKeyCreateSignature`), answering `account` service token requests for authenticated Switch network sessions.
+- **Network Service Availability & Config**: `nn::account::IsNetworkServiceAccountAvailable` reports availability to the title when Nextendo is enabled, and `nn::nifm::GetCurrentIpConfigInfo` / `GetCurrentPrimaryIpAddress` supply a valid primary network configuration on both modern and SDK 4/10 overloads.
+- **Native Error Applet**: When a title encounters a service or communication error (`nn::err::ShowError`, `ShowNetworkServiceError`, `ShowApplicationError`), the host formats the Nintendo error code (`2XXX-YYYY`) and presents a native modal dialog (`UIAlertController` on iOS, `NSAlert` on macOS) pausing the guest thread until acknowledged.
 
 ## Cheats
 
