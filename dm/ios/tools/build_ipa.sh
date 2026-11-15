@@ -160,6 +160,14 @@ LD=$(python3 -c 'import json, sys; print(next((s["default"] for s in json.load(o
 if [ -n "$LD" ] && [ "$LD" != "$DM_LANG" ]; then t "game language: the game has no $DM_LANG; packing $LD, its first"; export DM_LANG=$LD; fi
 # Diagnostic build: DM_ENV_FILE=file → dm/env.txt in the bundle (main.m sets one environment variable per line at boot)
 if [ -n "${DM_ENV_FILE:-}" ]; then cp "$DM_ENV_FILE" Gen/dm/env.txt || die "copy DM_ENV_FILE"; t "env: $(grep -v '^#' "$DM_ENV_FILE" | tr '\n' ' ')"; fi
+# Nextendo Network configuration
+NEXTENDO_CLIENT_ID=${NEXTENDO_CLIENT_ID:-"nxc_cUHxqMhkXXSA"}
+NEXTENDO_SERVER_IP=${NEXTENDO_SERVER_IP:-"51.178.29.194"}
+NEXTENDO_NAT_IP=${NEXTENDO_NAT_IP:-"164.132.111.120"}
+mkdir -p Gen/dm
+printf '{"client_id":"%s","server_ip":"%s","nat_ip":"%s"}\n' \
+  "$NEXTENDO_CLIENT_ID" "$NEXTENDO_SERVER_IP" "$NEXTENDO_NAT_IP" > Gen/dm/nextendo.json
+t "Nextendo Network: configured (client=$NEXTENDO_CLIENT_ID, server=$NEXTENDO_SERVER_IP, nat=$NEXTENDO_NAT_IP)"
 # The shader libraries go into the archive as DmIOS.app/msl/<folder>, or an NVN game's as the file DmIOS.app/msl/<folder>.img (main.m sets DM_MSL_DIR to msl)
 if [ "$GFXAPI" = vulkan ]; then MSLDIR=vk; elif [ "$GFXAPI" = gl ]; then MSLDIR=gl; else MSLDIR=b-$V; fi
 # Shared-font stand-ins, one per type (make_shared_fonts.py, about 7 s: unhinted cuts of STD_FONT, by default macOS's Arial Unicode, which iOS lacks, and the button icons; needs fontTools,

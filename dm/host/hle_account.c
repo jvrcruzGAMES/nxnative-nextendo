@@ -1,7 +1,16 @@
 // nn::account: the real device manages users via the acc:u0 service; the host has one fixed local user.
-// Online accounts (network service account / Nintendo Account authorization / tokens) are out of scope and uniformly return RES_FAIL; the async context's completion event fires immediately.
+// Online accounts (network service account / Nintendo Account authorization / tokens) use Nextendo when enabled.
 // Environment switch: DM_NICK=nickname (default Player).
 #include "hle.h"
+#include "hle_nextendo.h"
+
+static const char *get_game_display_version(void) {
+    const struct { const char *build, *ver; } k[] = {DM_GAME_DISPLAY_VERSIONS};
+    const char *ver = "1.0.0";
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
+        for (unsigned j = 0; j < sizeof k / sizeof *k; j++) if (k[j].build && !strcmp(g_mod[i].build_id, k[j].build)) ver = k[j].ver;
+    return ver;
+}
 
 typedef struct { uint64_t v[2]; } Uid;                 // nn::account::Uid, 16 bytes
 typedef struct { uint64_t v[3]; } UserHandle;          // nn::account::UserHandle, 24 bytes
@@ -47,50 +56,116 @@ HLE_FORCE("_ZN2nn7account9GetUserIdEPNS0_3UidERKNS0_10UserHandleE", "gets the Ui
     out->v[0] = h->v[0]; out->v[1] = h->v[1]; return RES_OK;
 }
 // nn::account::Nickname = struct { char name[33]; }, UTF-8
-HLE_FORCE("_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE", "user nickname; taken from DM_NICK", Result, h_acc_GetNick, char *nick, const Uid *uid) {
+HLE_FORCE("_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE", "user nickname; taken from Nextendo or DM_NICK", Result, h_acc_GetNick, char *nick, const Uid *uid) {
     (void)uid;
-    const char *e = getenv("DM_NICK");
+    const char *e = nextendo_enabled() ? nextendo_get_username() : NULL;
+    if (!e || !*e) e = getenv("DM_NICK");
     memset(nick, 0, 33); strncpy(nick, e ? e : "Player", 32);
     return RES_OK;
 }
 
-// ---------- Online accounts: cut ----------
-HLE_FORCE("_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE", "network service account, out of scope; cut: always unavailable", Result, h_acc_EnsureNsa, const UserHandle *h) { (void)h; return RES_FAIL; }
-HLE_FORCE("_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE", "network service account, out of scope; cut", Result, h_acc_GetNsaId, void *id, const UserHandle *h) { (void)id; (void)h; return RES_FAIL; }
-HLE_FORCE("_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE", "network service account token, out of scope; cut", Result, h_acc_LoadTok, uint64_t *n, char *buf, uint64_t sz, const UserHandle *h) {
-    (void)buf; (void)sz; (void)h; if (n) *n = 0; return RES_FAIL;
+// ---------- Online accounts: Nextendo or cut ----------
+HLE_FORCE("_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE", "network service account availability", Result, h_acc_EnsureNsa, const UserHandle *h) {
+    (void)h; return nextendo_enabled() ? RES_OK : RES_FAIL;
 }
-HLE_FORCE("_ZN2nn7account40ShowLicenseRequirementsForNetworkServiceERKNS0_10UserHandleE", "online membership notice applet, out of scope; cut", Result, h_acc_ShowLic, const UserHandle *h) { (void)h; return RES_FAIL; }
+HLE_FORCE("_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE", "network service account id", Result, h_acc_GetNsaId, uint64_t *id, const UserHandle *h) {
+    (void)h;
+    if (nextendo_enabled()) {
+        if (id) *id = nextendo_get_pid();
+        return RES_OK;
+    }
+    return RES_FAIL;
+}
+HLE_FORCE("_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE", "network service account token cache", Result, h_acc_LoadTok, uint64_t *n, char *buf, uint64_t sz, const UserHandle *h) {
+    (void)h;
+    if (nextendo_enabled()) {
+        const char *ver = get_game_display_version();
+        char jwt[2048];
+        int len = nextendo_generate_id_token(ver, DM_GAME_PROGRAM_ID, jwt, sizeof(jwt));
+        if (len > 0) {
+            if (buf && sz > 0) {
+                uint64_t cpy = ((uint64_t)len < sz) ? (uint64_t)len : (sz - 1);
+                memcpy(buf, jwt, cpy);
+                buf[cpy] = '\0';
+            }
+            if (n) *n = (uint64_t)len;
+            return RES_OK;
+        }
+    }
+    (void)buf; (void)sz; if (n) *n = 0; return RES_FAIL;
+}
+HLE_FORCE("_ZN2nn7account40ShowLicenseRequirementsForNetworkServiceERKNS0_10UserHandleE", "online membership notice applet", Result, h_acc_ShowLic, const UserHandle *h) {
+    (void)h; return nextendo_enabled() ? RES_OK : RES_FAIL;
+}
 // The Nintendo Account's cached profile (birthday, country): no Nintendo Account is linked on the host, so loading fails and the game skips its getters (Big Brain Academy: Brain vs. Brain, main+0xab8bc)
 HLE_FORCE("_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm", "cached Nintendo Account info: none linked, fails", Result, h_acc_LoadNaInfo,
           void *info, const UserHandle *h, void *buf, uint64_t sz) { (void)info; (void)h; (void)buf; (void)sz; return RES_FAIL; }
 
-// AsyncContext / NintendoAccountAuthorizationRequestContext: no request is sent, the completion event fires immediately, and the result is always failure.
-// AsyncContext is built by the SDK's own constructor, which is not taken over: it writes the class's vtable and nulls the IPC object pointer at +0x18, and sends
-// nothing (SDK 19.3.11: sdk+0x1ad6c8). No interface below sets that pointer, so the SDK's destructor, reached through the vtable, finds no session to close.
-// The object is polymorphic: Pokémon Friends' C# binding deletes it from nn.account.AsyncContext's finalizer through the virtual deleting destructor, inlined
-// in main (main+0x5b64f0), which the D1Ev takeover below never sees. A host constructor that wrote no memory left the allocator's bytes in the vtable word,
-// and that call jumped through them (docs/reference/services.md, "An account AsyncContext needs its SDK constructor").
-// NintendoAccountAuthorizationRequestContext has no vtable: its constructor writes no memory, and its contents are read and written only by the interfaces below.
-HLE_FORCE("_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE", "network service account token, out of scope; cut", Result, h_acc_EnsureTokAsync, void *ctx, const UserHandle *h) { (void)ctx; (void)h; return RES_FAIL; }
+// AsyncContext / NintendoAccountAuthorizationRequestContext:
+HLE_FORCE("_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE", "network service account token async", Result, h_acc_EnsureTokAsync, void *ctx, const UserHandle *h) {
+    (void)ctx; (void)h; return nextendo_enabled() ? RES_OK : RES_FAIL;
+}
 HLE_FORCE("_ZN2nn7account12AsyncContext14GetSystemEventEPNS_2os11SystemEventE", "async completion event; fires immediately", Result, h_acc_AcGetEv, void *self, void *ev) { (void)self; hle_signal_system_event(ev); return RES_OK; }
-HLE_FORCE("_ZN2nn7account12AsyncContext9GetResultEv", "async result; networking is cut, always fails", Result, h_acc_AcGetRes, void *self) { (void)self; return RES_FAIL; }
+HLE_FORCE("_ZN2nn7account12AsyncContext9GetResultEv", "async result", Result, h_acc_AcGetRes, void *self) {
+    (void)self; return nextendo_enabled() ? RES_OK : RES_FAIL;
+}
 HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContextC1Ev", "Nintendo Account authorization, out of scope; the constructor writes no memory", void, h_acc_NaCtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContextD1Ev", "Nintendo Account authorization, out of scope", void, h_acc_NaDtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn7account41CreateNintendoAccountAuthorizationRequestEPNS0_42NintendoAccountAuthorizationRequestContextERKNS0_10UserHandleERKNS0_45NintendoAccountAuthorizationRequestParametersEPvm",
-          "Nintendo Account authorization, out of scope; cut", Result, h_acc_NaCreate, void *ctx, const UserHandle *h, const void *prm, void *buf, uint64_t sz) {
-    (void)ctx; (void)h; (void)prm; (void)buf; (void)sz; return RES_FAIL;
+          "Nintendo Account authorization request", Result, h_acc_NaCreate, void *ctx, const UserHandle *h, const void *prm, void *buf, uint64_t sz) {
+    (void)ctx; (void)h; (void)prm; (void)buf; (void)sz; return nextendo_enabled() ? RES_OK : RES_FAIL;
 }
 HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContext14GetSystemEventEPNS_2os11SystemEventE", "authorization completion event; fires immediately", Result, h_acc_NaGetEv, void *self, void *ev) { (void)self; hle_signal_system_event(ev); return RES_OK; }
-HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContext34GetResultWithInteractionIfRequiredEv", "authorization result; always fails", Result, h_acc_NaGetRes, void *self) { (void)self; return RES_FAIL; }
-HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContext10GetIdTokenEPmPcm", "authorization token; always fails", Result, h_acc_NaGetTok, void *self, uint64_t *n, char *buf, uint64_t sz) {
-    (void)self; (void)buf; (void)sz; if (n) *n = 0; return RES_FAIL;
+HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContext34GetResultWithInteractionIfRequiredEv", "authorization result", Result, h_acc_NaGetRes, void *self) {
+    (void)self; return nextendo_enabled() ? RES_OK : RES_FAIL;
 }
-HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContext20GetAuthorizationCodeEPmPcm", "authorization code; always fails", Result, h_acc_NaGetCode, void *self, uint64_t *n, char *buf, uint64_t sz) {
-    (void)self; (void)buf; (void)sz; if (n) *n = 0; return RES_FAIL;
+HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContext10GetIdTokenEPmPcm", "authorization token", Result, h_acc_NaGetTok, void *self, uint64_t *n, char *buf, uint64_t sz) {
+    (void)self;
+    if (nextendo_enabled()) {
+        const char *ver = get_game_display_version();
+        char jwt[2048];
+        int len = nextendo_generate_id_token(ver, DM_GAME_PROGRAM_ID, jwt, sizeof(jwt));
+        if (len > 0) {
+            if (buf && sz > 0) {
+                uint64_t cpy = ((uint64_t)len < sz) ? (uint64_t)len : (sz - 1);
+                memcpy(buf, jwt, cpy);
+                buf[cpy] = '\0';
+            }
+            if (n) *n = (uint64_t)len;
+            return RES_OK;
+        }
+    }
+    (void)buf; (void)sz; if (n) *n = 0; return RES_FAIL;
 }
-HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContext8GetStateEPmPcm", "authorization state string; always fails", Result, h_acc_NaGetState, void *self, uint64_t *n, char *buf, uint64_t sz) {
-    (void)self; (void)buf; (void)sz; if (n) *n = 0; return RES_FAIL;
+HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContext20GetAuthorizationCodeEPmPcm", "authorization code", Result, h_acc_NaGetCode, void *self, uint64_t *n, char *buf, uint64_t sz) {
+    (void)self;
+    if (nextendo_enabled()) {
+        const char *code = "nextendo_auth_code";
+        uint64_t len = strlen(code);
+        if (buf && sz > 0) {
+            uint64_t cpy = (len < sz) ? len : (sz - 1);
+            memcpy(buf, code, cpy);
+            buf[cpy] = '\0';
+        }
+        if (n) *n = len;
+        return RES_OK;
+    }
+    (void)buf; (void)sz; if (n) *n = 0; return RES_FAIL;
+}
+HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContext8GetStateEPmPcm", "authorization state string", Result, h_acc_NaGetState, void *self, uint64_t *n, char *buf, uint64_t sz) {
+    (void)self;
+    if (nextendo_enabled()) {
+        const char *st = "nextendo";
+        uint64_t len = strlen(st);
+        if (buf && sz > 0) {
+            uint64_t cpy = (len < sz) ? len : (sz - 1);
+            memcpy(buf, st, cpy);
+            buf[cpy] = '\0';
+        }
+        if (n) *n = len;
+        return RES_OK;
+    }
+    (void)buf; (void)sz; if (n) *n = 0; return RES_FAIL;
 }
 
 // ---------- Account interfaces used by newer SDKs: user enumeration / existence / profile image, the remaining AsyncContext members ----------

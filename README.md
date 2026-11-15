@@ -4,7 +4,7 @@ Play your own Nintendo Switch and Switch 2 games natively on Apple silicon Macs,
 
 It is not an emulator: the game's own code runs directly on the Apple chip, with Switch graphics rebuilt on Metal. Nothing from any game is in this repository, and the project is not affiliated with Nintendo or any game publisher.
 
-[Games](#games) · [Community front ends](#community-front-ends) · [Requirements](#requirements) · [How to play](#how-to-play) · [Discussions](#discussions) · [For developers](#for-developers)
+[Games](#games) · [Community front ends](#community-front-ends) · [Requirements](#requirements) · [How to play](#how-to-play) · [Nextendo Network](#nextendo-network) · [Discussions](#discussions) · [For developers](#for-developers)
 
 ## Games
 
@@ -123,6 +123,12 @@ python3 scripts/build_ipa_from_nsp.py ~/Games/DonkeyKongBananza --platform mac-a
 ```
 
 An update's folder alone will do (no `base/`), and so will `exefs/` and `romfs/` directly in the folder, as `nup extract` writes them, which count as `base/`. The app has no icon, because the folder holds none; `--icon <image>` (`ICON` in Spyder) gives it one. To turn such a folder into a NUP: `nup pack ~/Games/DonkeyKongBananza game.nup`.
+
+## Nextendo Network
+
+nxnative includes built-in support for connecting to the [Nextendo Network](https://nextendo.network) for online multiplayer and services.
+
+To link your Nextendo account, click **Log In with Nextendo** directly on the launcher settings screen before starting the game. The app securely stores your OAuth token in Apple Keychain. Nextendo features are active automatically whenever you are logged in. See [Nextendo Network](docs/development.md#nextendo-network) for details.
 
 ## Discussions
 

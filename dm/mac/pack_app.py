@@ -89,8 +89,8 @@ def min_os(host):   # the host's deployment target (LC_BUILD_VERSION minos): the
     return m.group(1) if m else '14.0'
 
 
-def swift_sources():   # the settings window, with the iOS launcher's model, rows and cloud-save report
-    return [HERE / 'Launcher.swift', HERE.parent / 'ios/Sources/LauncherSettings.swift', HERE.parent / 'ios/Sources/LauncherRow.swift', HERE.parent / 'ios/Sources/SaveSyncReport.swift']
+def swift_sources():   # the settings window, with the iOS launcher's model, rows, cloud-save report and nextendo auth
+    return [HERE / 'Launcher.swift', HERE.parent / 'ios/Sources/LauncherSettings.swift', HERE.parent / 'ios/Sources/LauncherRow.swift', HERE.parent / 'ios/Sources/SaveSyncReport.swift', HERE.parent / 'ios/Sources/NextendoAuth.swift']
 
 
 def build_launcher(out, minos, clang, swiftc, sdk):   # launcher.c's main and the host's cloud-save code (its send after the host exits), linked by swiftc with the settings window (no Swift main: -parse-as-library)
@@ -99,7 +99,7 @@ def build_launcher(out, minos, clang, swiftc, sdk):   # launcher.c's main and th
         for obj, src in zip(objs, (HERE / 'launcher.c', HERE.parent / 'host/save_sync.c')):
             run([clang, '-isysroot', sdk, '-arch', 'arm64', f'-mmacosx-version-min={minos}', '-O2', '-Wall', '-I', HERE.parent / 'host', '-c', '-o', obj, src])
         run([swiftc, '-sdk', sdk, '-target', f'arm64-apple-macos{minos}', '-O', '-swift-version', '5', '-parse-as-library', '-module-cache-path', Path(t) / 'module-cache',
-             '-o', out, *swift_sources(), *objs, '-framework', 'CoreFoundation', '-framework', 'AppKit', '-framework', 'SwiftUI'])
+             '-o', out, *swift_sources(), *objs, '-framework', 'CoreFoundation', '-framework', 'AppKit', '-framework', 'SwiftUI', '-framework', 'Security'])
 
 
 def make_icns(jpg, out):   # the game's icon (256x256 JPEG) at every size an .icns holds
@@ -365,6 +365,14 @@ def pack(a):
     if fonts: copy(fonts, dm / 'font', False)
     if a.env_file: shutil.copyfile(a.env_file, dm / 'env.txt')
     if a.settings: shutil.copyfile(a.settings, dm / 'launcher.json')
+    cid = getattr(a, 'nextendo_client_id', None) or 'nxc_cUHxqMhkXXSA'
+    srv = getattr(a, 'nextendo_server_ip', None) or '51.178.29.194'
+    nat = getattr(a, 'nextendo_nat_ip', None) or '164.132.111.120'
+    (dm / 'nextendo.json').write_text(json.dumps({
+        'client_id': cid,
+        'server_ip': srv,
+        'nat_ip': nat
+    }, indent=2) + '\n')
     if a.control_nacp: shutil.copyfile(a.control_nacp, res / 'control.nacp')
     msl_dst = res / 'msl' / (a.msl_name or msl.name)
     old_app = out if out.is_dir() else None
@@ -445,6 +453,9 @@ def parse(argv):
     ap.add_argument('--control-nacp', help='the game\'s control data (control.nacp; Resources/control.nacp, beside the RomFS, where the host reads it: fs::GetCacheStorageMax)')
     ap.add_argument('--env-file', help='environment switches baked in (Resources/dm/env.txt)')
     ap.add_argument('--settings', help='the game\'s launcher settings (dm/games/settings.py output; Resources/dm/launcher.json, which the Mac front end reads)')
+    ap.add_argument('--nextendo-client-id', default='nxc_cUHxqMhkXXSA', help='Nextendo client ID')
+    ap.add_argument('--nextendo-server-ip', default='51.178.29.194', help='Nextendo server IP')
+    ap.add_argument('--nextendo-nat-ip', default='164.132.111.120', help='Nextendo NAT server IP')
     ap.add_argument('--title-id', required=True); ap.add_argument('--name', required=True)
     ap.add_argument('--version'); ap.add_argument('--bundle-id'); ap.add_argument('--category'); ap.add_argument('--lang'); ap.add_argument('--marker', help='the profile\'s romfs_marker')
     ap.add_argument('--icon', help='the game icon (icon.jpg from the control data)')
