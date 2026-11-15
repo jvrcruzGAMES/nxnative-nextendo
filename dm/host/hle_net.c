@@ -571,7 +571,7 @@ int dm_sk_select(int nfds, uint64_t *r, uint64_t *w, uint64_t *e, const int64_t 
 SKF("_ZN2nn6socket6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE", h_sk_Socket, int a, int b, int c) { return dm_sk_socket(a, b, c); }
 SKF("_ZN2nn6socket4BindEiPKNS0_8SockAddrEj", h_sk_Bind, int s, const void *a, unsigned n) { return dm_sk_bind(s, a, n); }
 SKF("_ZN2nn6socket7ConnectEiPKNS0_8SockAddrEj", h_sk_Connect, int s, const void *a, unsigned n) { return dm_sk_connect(s, a, n); }
-SKF("_ZN2nn6socket6ListenEii", h_sk_Listen, int s, int n) {
+int dm_sk_listen(int s, int n) {
     if (nextendo_enabled() && s >= 0 && s < EFD_MAX) {
         dm_host_mutex_lock(&g_efd_m);
         int real = g_efd[s].real_fd;
@@ -580,7 +580,8 @@ SKF("_ZN2nn6socket6ListenEii", h_sk_Listen, int s, int n) {
     }
     return sk_fail();
 }
-SKF("_ZN2nn6socket6AcceptEiPNS0_8SockAddrEPj", h_sk_Accept, int s, void *a, unsigned *n) {
+
+int dm_sk_accept(int s, void *a, unsigned *n) {
     if (nextendo_enabled() && s >= 0 && s < EFD_MAX) {
         dm_host_mutex_lock(&g_efd_m);
         int real = g_efd[s].real_fd;
@@ -611,6 +612,9 @@ SKF("_ZN2nn6socket6AcceptEiPNS0_8SockAddrEPj", h_sk_Accept, int s, void *a, unsi
     }
     return sk_fail();
 }
+
+SKF("_ZN2nn6socket6ListenEii", h_sk_Listen, int s, int n) { return dm_sk_listen(s, n); }
+SKF("_ZN2nn6socket6AcceptEiPNS0_8SockAddrEPj", h_sk_Accept, int s, void *a, unsigned *n) { return dm_sk_accept(s, a, n); }
 SKF("_ZN2nn6socket5CloseEi", h_sk_Close, int s) { return dm_sk_close(s); }
 SKF("_ZN2nn6socket11GetPeerNameEiPNS0_8SockAddrEPj", h_sk_GetPeerName, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 1); }
 SKF("_ZN2nn6socket11GetSockNameEiPNS0_8SockAddrEPj", h_sk_GetSockName, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 0); }
@@ -636,7 +640,7 @@ HLE_FORCE("_ZN2nn6socket12GetLastErrorEv", "socket error code kept by the host",
 HLE_FORCE("_ZN2nn6socket12SetAllocatorEPNS_14MemoryResourceE", "socket library allocator", void, h_sk_SetAlloc, void *r) { (void)r; }
 
 // DNS Resolution
-HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_", "name resolution", int, h_sk_GetAddrInfo, const char *h, const char *s, const void *hint, void **res) {
+int dm_sk_getaddrinfo(const char *h, const char *s, const void *hint, void **res) {
     if (!res) return 4; // EAI_FAIL
     *res = NULL;
     if (!nextendo_enabled()) return 4;
@@ -694,8 +698,16 @@ HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_", "name resolu
     *res = ai;
     return 0;
 }
-HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEPNS0_8AddrInfoE", "pairs with GetAddrInfo", void, h_sk_FreeAddrInfo, void *ai) {
+
+void dm_sk_freeaddrinfo(void *ai) {
     if (ai) free(ai);
+}
+
+HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_", "name resolution", int, h_sk_GetAddrInfo, const char *h, const char *s, const void *hint, void **res) {
+    return dm_sk_getaddrinfo(h, s, hint, res);
+}
+HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEPNS0_8AddrInfoE", "pairs with GetAddrInfo", void, h_sk_FreeAddrInfo, void *ai) {
+    dm_sk_freeaddrinfo(ai);
 }
 
 static void *resolve_hostent(const char *n) {

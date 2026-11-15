@@ -2,6 +2,7 @@
 import Foundation
 import Security
 import SwiftUI
+import WebKit
 #if canImport(AppKit)
 import AppKit
 #endif
@@ -164,7 +165,7 @@ final class NextendoCallbackServer {
                 if let firstLine = req.split(separator: "\r\n").first,
                    let getPart = firstLine.split(separator: " ").dropFirst().first {
                     let path = String(getPart)
-                    let (code, token, error) = parseQueryParams(path)
+                    let (code, token, error) = Self.parseQueryParams(path)
 
                     let html = """
                     <!DOCTYPE html>
@@ -201,7 +202,7 @@ final class NextendoCallbackServer {
         }
     }
 
-    private func parseQueryParams(_ urlStr: String) -> (code: String?, token: String?, error: String?) {
+    static func parseQueryParams(_ urlStr: String) -> (code: String?, token: String?, error: String?) {
         guard let queryStart = urlStr.firstIndex(of: "?") else { return (nil, nil, nil) }
         let queryString = String(urlStr[urlStr.index(after: queryStart)...])
         var code: String?
@@ -238,6 +239,8 @@ public final class NextendoAuth: ObservableObject {
     @Published public private(set) var token = ""
     @Published public private(set) var isLoggingIn = false
     @Published public var errorMessage: String?
+    @Published public var showAuthSheet = false
+    @Published public var authURL: URL? = nil
 
     public var pidString: String {
         pid == 0 ? "-" : String(format: "0x%016llX (%llu)", pid, pid)
@@ -301,25 +304,24 @@ public final class NextendoAuth: ObservableObject {
             URLQueryItem(name: "client_id", value: Self.clientId),
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "redirect_uri", value: Self.redirectUri),
-            URLQueryItem(name: "scope", value: "openid profile nex"),
+            URLQueryItem(name: "scope", value: "identity presence profil game.matchmaking"),
             URLQueryItem(name: "code_challenge", value: challenge),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
             URLQueryItem(name: "state", value: state)
         ]
 
         if let url = components.url {
-            #if os(macOS)
-            NSWorkspace.shared.open(url)
-            #elseif os(iOS)
-            UIApplication.shared.open(url, options: [:], completionHandler: nil)
-            #endif
+            self.authURL = url
+            self.showAuthSheet = true
         }
     }
 
     public func cancelLogin() {
         callbackServer.stop()
         isLoggingIn = false
+        showAuthSheet = false
         activeVerifier = ""
+        authURL = nil
     }
 
     public func logout() {
@@ -335,8 +337,15 @@ public final class NextendoAuth: ObservableObject {
         errorMessage = nil
     }
 
+    public func handleCallbackURL(_ url: URL) {
+        let (code, token, error) = NextendoCallbackServer.parseQueryParams(url.absoluteString)
+        handleCallback(code: code, token: token, error: error)
+    }
+
     private func handleCallback(code: String?, token: String?, error: String?) {
         isLoggingIn = false
+        showAuthSheet = false
+        authURL = nil
         if let error = error {
             errorMessage = "Login failed: \(error)"
             return
@@ -505,7 +514,7 @@ public struct NextendoSection: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
-                        Text("Waiting for Nextendo login in browser…")
+                        Text("Nextendo login in progress…")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
@@ -534,5 +543,118 @@ public struct NextendoSection: View {
                  ? "Online features are enabled for this session."
                  : "Log in with your Nextendo account to enable online features. If not logged in, online features are disabled.")
         }
+        .sheet(isPresented: $auth.showAuthSheet, onDismiss: {
+            if auth.isLoggingIn {
+                auth.cancelLogin()
+            }
+        }) {
+            if auth.authURL != nil {
+                NextendoAuthSheetView(auth: auth)
+            }
+        }
+    }
+}
+
+// MARK: - In-App WebKit Authentication View
+
+#if canImport(UIKit)
+public struct NextendoWebKitView: UIViewRepresentable {
+    @ObservedObject var auth: NextendoAuth
+
+    public func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        if let url = auth.authURL {
+            webView.load(URLRequest(url: url))
+        }
+        return webView
+    }
+
+    public func updateUIView(_ uiView: WKWebView, context: Context) {}
+
+    public func makeCoordinator() -> Coordinator {
+        Coordinator(auth: auth)
+    }
+
+    public class Coordinator: NSObject, WKNavigationDelegate {
+        var auth: NextendoAuth
+
+        init(auth: NextendoAuth) {
+            self.auth = auth
+        }
+
+        public func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            if let url = navigationAction.request.url, url.absoluteString.hasPrefix(NextendoAuth.redirectUri) {
+                auth.handleCallbackURL(url)
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
+        }
+    }
+}
+#elseif canImport(AppKit)
+public struct NextendoWebKitView: NSViewRepresentable {
+    @ObservedObject var auth: NextendoAuth
+
+    public func makeNSView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        if let url = auth.authURL {
+            webView.load(URLRequest(url: url))
+        }
+        return webView
+    }
+
+    public func updateNSView(_ nsView: WKWebView, context: Context) {}
+
+    public func makeCoordinator() -> Coordinator {
+        Coordinator(auth: auth)
+    }
+
+    public class Coordinator: NSObject, WKNavigationDelegate {
+        var auth: NextendoAuth
+
+        init(auth: NextendoAuth) {
+            self.auth = auth
+        }
+
+        public func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            if let url = navigationAction.request.url, url.absoluteString.hasPrefix(NextendoAuth.redirectUri) {
+                auth.handleCallbackURL(url)
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
+        }
+    }
+}
+#endif
+
+public struct NextendoAuthSheetView: View {
+    @ObservedObject var auth: NextendoAuth
+    @Environment(\.dismiss) private var dismiss
+
+    public var body: some View {
+        NavigationStack {
+            NextendoWebKitView(auth: auth)
+                .navigationTitle("Sign in with Nextendo")
+                #if os(iOS)
+                .navigationBarTitleDisplayMode(.inline)
+                #endif
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") {
+                            auth.cancelLogin()
+                            dismiss()
+                        }
+                    }
+                }
+        }
+        #if os(macOS)
+        .frame(minWidth: 500, minHeight: 600)
+        #endif
     }
 }

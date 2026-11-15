@@ -1754,6 +1754,28 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
     return 1;
 }
 
+// Error dialog (front.h): the main thread shows a native NSAlert modal and the guest thread waits synchronously.
+void front_error_dialog(const char *code, const char *msg) {
+    if (!g_layer) {
+        LOG("front end: error dialog (no layer): [%s] %s", code ? code : "", msg ? msg : "");
+        return;
+    }
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
+        dm_touch_set(NULL, 0);
+        NSAlert *a = [NSAlert new];
+        a.alertStyle = NSAlertStyleCritical;
+        a.messageText = (code && *code) ? [NSString stringWithFormat:@"Error %s", code] : @"Error";
+        a.informativeText = (msg && *msg) ? @(msg) : @"An error occurred.";
+        [a addButtonWithTitle:@"OK"];
+        [NSApp activateIgnoringOtherApps:YES];
+        [a layout];
+        NSWindow *game = g_win;
+        if (game && a.window.level <= game.level) a.window.level = game.level + 1;
+        [a runModal];
+    });
+}
+
 // GPU lost (front.h): macOS runs none of the game's GPU work any more and nothing is drawn again. In full screen the frozen game held the whole screen (#1326: WindowServer froze for 40 s
 // and its watchdog killed it), so the window leaves full screen first and the alert comes once it has, or after 3 s if it has not. Then the app quits with exit status 70
 // (EX_SOFTWARE), so a launcher or script that runs it sees a failed run: exit() runs the same atexit handlers as ⌘Q's terminate (the one will-terminate

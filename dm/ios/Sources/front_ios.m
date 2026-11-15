@@ -474,6 +474,39 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
     return 1;
 }
 
+// Error dialog (front.h): show a native UIAlertController on the main thread and wait until dismissed
+void front_error_dialog(const char *code, const char *msg) {
+    if (!g_layer) {
+        LOG("front end: error dialog (no layer): [%s] %s", code ? code : "", msg ? msg : "");
+        return;
+    }
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    NSString *t = (code && *code) ? [NSString stringWithFormat:@"Error %s", code] : @"Error";
+    NSString *m = (msg && *msg) ? @(msg) : @"An error occurred.";
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *vc = nil;
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if ([s isKindOfClass:UIWindowScene.class]) {
+                for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                    if (w.isKeyWindow) vc = w.rootViewController;
+                }
+            }
+        }
+        while (vc.presentedViewController) vc = vc.presentedViewController;
+        if (!vc) {
+            dispatch_semaphore_signal(done);
+            return;
+        }
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:t message:m preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+            (void)act;
+            dispatch_semaphore_signal(done);
+        }]];
+        [vc presentViewController:a animated:YES completion:nil];
+    });
+    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+}
+
 // Save write failed (most likely the phone's storage is full): show a notice on the main thread without blocking the game. hle_fs.c calls this when a save transaction is refused or a mount has to fall back to read-only;
 // the iOS front end used not to implement it, so there was only a log line and the player never learned that progress was not being saved
 void front_save_failed(int err) {

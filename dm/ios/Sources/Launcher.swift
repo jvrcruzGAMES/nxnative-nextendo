@@ -119,6 +119,7 @@ private struct LauncherView: View {
                 .padding(16)
                 .frame(width: geometry.size.width / 3, height: geometry.size.height)
                 List {
+                    NextendoSection()
                     ForEach(m.sections, id: \.self) { section in
                         let rows = m.rows(in: section)
                         if !rows.isEmpty {
@@ -134,7 +135,6 @@ private struct LauncherView: View {
                         Text("Brings back all settings this game was tested with.")
                     }
                     CloudSavesSection()
-                    NextendoSection()
                     Section {
                         HStack {
                             Text("Memory available")

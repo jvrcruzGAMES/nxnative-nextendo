@@ -47,6 +47,11 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
 // 0: closed (B, Escape); -1 with no window: nothing shown, the caller answers as the player closing it
 int front_ctrl_support(int min, int max);
 
+// Error dialog (called by Error Applet / nn::err; hle_offline.c, hle_misc.c): the main thread shows a native modal dialog
+// with the Switch error code and message, and the calling guest thread blocks until dismissed by the user.
+// With no window or headless, the default weak implementation logs and returns immediately.
+void front_error_dialog(const char *code, const char *msg);
+
 // Early start of host loading (main.c): reading the NSO / relocation / forced takeover / prefetch start are moved to a background thread, in parallel with the front end (UIKit launch chain, Metal view);
 // the dm_main / main called afterwards waits for it to finish. For call timing and preconditions see the comments in main.c (set DM_ROMFS and the other environment variables and the cwd first; arguments identical item by item to those of the later main).
 void dm_host_preload_start(int argc, char **argv);

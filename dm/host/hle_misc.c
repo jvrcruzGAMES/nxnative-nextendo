@@ -1,7 +1,12 @@
 // Miscellaneous service layer: add-on content / shop / error applet / profanity filter / server name resolution / parental controls / software keyboard.
 // On the real device each goes through IPC or a system applet; the host gives results as single-player offline. Pure-computation SDK parts (hash, util, software Opus) are not taken over, the original implementation is used directly.
 #include "hle.h"
+#include "front.h"
 #include <dirent.h>
+
+__attribute__((weak)) void front_error_dialog(const char *code, const char *msg) {
+    (void)code; (void)msg;
+}
 
 // ---------- aoc add-on content (the DLC NSPs in the player's folder) / ec shop (excluded) ----------
 // Owned add-on content indices (ascending), fixed at the first query:
@@ -115,9 +120,17 @@ HLE_FORCE("_ZNK2nn2ec19ShopServiceAccessor13AsyncResponse12GetErrorCodeEv", "sho
 // The "add-on content lost" error screen is an applet too: logged only
 HLE_FORCE("_ZN2nn3aoc25ShowAddOnContentLostErrorEPKii", "add-on content lost error applet; the host only logs it", void, h_aoc_LostErr, const int *idx, int n) { DM_APPLET("error"); (void)idx; LOG("aoc::ShowAddOnContentLostError (%d entries) (cut)", n); }
 
-// ---------- err error applet: printed by the host ----------
-HLE_FORCE("_ZN2nn3err9ShowErrorENS_6ResultE", "error display applet; the host prints the module / description number", void, h_err_ShowError, Result r) { DM_APPLET("error");
-    LOG("err::ShowError Result=%#x (module %u, description %u)", r, r & 0x1ff, (r >> 9) & 0x1fff);
+// ---------- err error applet: printed by the host and shown via front end dialog ----------
+HLE_FORCE("_ZN2nn3err9ShowErrorENS_6ResultE", "error display applet; the host prints the module / description number", void, h_err_ShowError, Result r) {
+    DM_APPLET("error");
+    unsigned mod = r & 0x1ff;
+    unsigned desc = (r >> 9) & 0x1fff;
+    char code[32];
+    snprintf(code, sizeof(code), "%04u-%04u", 2000 + mod, desc);
+    LOG("err::ShowError Result=%#x (module %u, description %u) -> %s", r, mod, desc, code);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "An error occurred.\nError Code: %s (Result: 0x%08x)", code, r);
+    front_error_dialog(code, msg);
 }
 
 // ---------- ngc profanity filter: the word list is in a system data save (mounted via IPC); single-player has no text visible to others, always judged as no profanity ----------

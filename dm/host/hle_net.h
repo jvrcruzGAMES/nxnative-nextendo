@@ -4,6 +4,10 @@
 int dm_sk_socket(int family, int type, int protocol);
 int dm_sk_bind(int fd, const void *addr, unsigned size);
 int dm_sk_connect(int fd, const void *addr, unsigned size);
+int dm_sk_listen(int s, int n);
+int dm_sk_accept(int s, void *a, unsigned *n);
+int dm_sk_getaddrinfo(const char *h, const char *s, const void *hint, void **res);
+void dm_sk_freeaddrinfo(void *ai);
 int dm_sk_close(int fd);
 int dm_sk_shutdown(int fd, int how);
 int dm_sk_name(int fd, void *addr, unsigned *size, int peer);

@@ -3,6 +3,8 @@
 // Return convention as in hle_friends.c: Result returns RES_FAIL ("saved / submitted" kinds return RES_OK so the game does not retry); bool returns false; events get a bound SystemEvent that never fires.
 #include "hle.h"
 #include "hle_net.h"
+#include "hle_nextendo.h"
+#include "front.h"
 
 static _Alignas(16) uint8_t g_ev_ldn[0x100];
 
@@ -80,12 +82,12 @@ HLE_FORCE("_ZN2nn6socket6SelectEiP6fd_setS2_S2_P7timeval", "Poll over process-lo
 HLE_FORCE("_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj", "local UDP (offline BSD service)", long, h_sk_SendTo, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { return dm_sk_sendto(s, b, n, f, a, al); }
 HLE_FORCE("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", "local UDP (offline BSD service)", long, h_sk_SendTo2, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { return dm_sk_sendto(s, b, n, f, a, al); }
 HLE_FORCE("_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", "local UDP (offline BSD service)", long, h_sk_RecvFrom2, int s, void *b, unsigned long n, int f, void *a, unsigned *al) { return dm_sk_recvfrom(s, b, n, f, a, al); }
-HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PK8addrinfoPPS3_", "name resolution (cut): EAI_FAIL", int, h_sk_Gai2, const char *h, const char *s, const void *hint, void **res) { (void)h; (void)s; (void)hint; if (res) *res = NULL; return SK_EAI_FAIL; }
-HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEP8addrinfo", "pairs with GetAddrInfo (cut)", void, h_sk_FreeAi2, void *ai) { (void)ai; }
+HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PK8addrinfoPPS3_", "name resolution: Nextendo or EAI_FAIL", int, h_sk_Gai2, const char *h, const char *s, const void *hint, void **res) { return dm_sk_getaddrinfo(h, s, hint, res); }
+HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEP8addrinfo", "pairs with GetAddrInfo", void, h_sk_FreeAi2, void *ai) { dm_sk_freeaddrinfo(ai); }
 HLE_FORCE("_ZN2nn6socket11GAIStrErrorENS0_7AiErrnoE", "resolver error text", const char *, h_sk_GaiStr, int e) { (void)e; return "network unavailable"; }
 // SDK 11's overloads with plain sockaddr / int arguments (Big Brain Academy: Brain vs. Brain, through Pia)
 HLE_FORCE("_ZN2nn6socket7ConnectEiPK8sockaddrj", "local UDP (offline BSD service)", int, h_sk_Connect2, int s, const void *a, unsigned n) { return dm_sk_connect(s, a, n); }
-HLE_FORCE("_ZN2nn6socket6AcceptEiP8sockaddrPj", "offline (cut)", int, h_sk_Accept2, int s, void *a, unsigned *n) { (void)s; (void)a; (void)n; return -1; }
+HLE_FORCE("_ZN2nn6socket6AcceptEiP8sockaddrPj", "accept connection", int, h_sk_Accept2, int s, void *a, unsigned *n) { return dm_sk_accept(s, a, n); }
 HLE_FORCE("_ZN2nn6socket11GetSockNameEiP8sockaddrPj", "local UDP (offline BSD service)", int, h_sk_GetSockName2, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 0); }
 HLE_FORCE("_ZN2nn6socket10GetSockOptEiiiPvPj", "local UDP (offline BSD service)", int, h_sk_GetSockOpt2, int s, int l, int o, void *v, unsigned *n) { return dm_sk_getopt(s, l, o, v, n); }
 HLE_FORCE("_ZN2nn6socket10SetSockOptEiiiPKvj", "local UDP (offline BSD service)", int, h_sk_SetSockOpt2, int s, int l, int o, const void *v, unsigned n) { return dm_sk_setopt(s, l, o, v, n); }
@@ -129,14 +131,36 @@ HLE_FORCE("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS0_26BuiltInCer
 // ---------- nifm / nsd: offline ----------
 HLE_FORCE("_ZN2nn4nifm19SetLocalNetworkModeEb", "offline: the local network mode switch is ignored", void, h_nifm_LocalMode, unsigned on) { (void)on; }
 HLE_FORCE("_ZN2nn4nifm27SubmitNetworkRequestAndWaitEv", "offline: the network request is not submitted (returns at once, IsNetworkAvailable is always false)", void, h_nifm_SubmitWait, void) {}
-HLE_FORCE("_ZN2nn4nifm22GetCurrentIpConfigInfoEP7in_addrS2_S2_S2_S2_", "offline: no IP configuration", Result, h_nifm_IpCfg, uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d, uint32_t *e) {
+HLE_FORCE("_ZN2nn4nifm22GetCurrentIpConfigInfoEP7in_addrS2_S2_S2_S2_", "IP configuration (Nextendo or offline)", Result, h_nifm_IpCfg, uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d, uint32_t *e) {
+    if (nextendo_enabled()) {
+        if (a) *a = htonl(0xc0a80164); // 192.168.1.100
+        if (b) *b = htonl(0xffffff00); // 255.255.255.0
+        if (c) *c = htonl(0xc0a80101); // 192.168.1.1
+        if (d) *d = htonl(0x01010101); // 1.1.1.1
+        if (e) *e = htonl(0x08080808); // 8.8.8.8
+        return RES_OK;
+    }
     uint32_t *p[5] = {a, b, c, d, e}; for (int i = 0; i < 5; i++) if (p[i]) *p[i] = 0; return RES_FAIL;
 }
 // SDK 10's functions of the same name take socket::InAddr / in_addr, exactly the other way round from the generation above and in hle_net.c (Super Mario 3D World + Bowser's Fury)
-HLE_FORCE("_ZN2nn4nifm22GetCurrentIpConfigInfoEPNS_6socket6InAddrES3_S3_S3_S3_", "offline: no IP configuration (SDK 10 overload)", Result, h_nifm_IpCfg10, uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d, uint32_t *e) {
+HLE_FORCE("_ZN2nn4nifm22GetCurrentIpConfigInfoEPNS_6socket6InAddrES3_S3_S3_S3_", "IP configuration (SDK 10 overload)", Result, h_nifm_IpCfg10, uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d, uint32_t *e) {
+    if (nextendo_enabled()) {
+        if (a) *a = htonl(0xc0a80164);
+        if (b) *b = htonl(0xffffff00);
+        if (c) *c = htonl(0xc0a80101);
+        if (d) *d = htonl(0x01010101);
+        if (e) *e = htonl(0x08080808);
+        return RES_OK;
+    }
     uint32_t *p[5] = {a, b, c, d, e}; for (int i = 0; i < 5; i++) if (p[i]) *p[i] = 0; return RES_FAIL;
 }
-HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr", "offline: no IP (SDK 10 overload)", Result, h_nifm_GetIp10, uint32_t *a) { if (a) *a = 0; return RES_FAIL; }
+HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr", "primary IP (Nextendo or offline)", Result, h_nifm_GetIp10, uint32_t *a) {
+    if (nextendo_enabled()) {
+        if (a) *a = htonl(0xc0a80164);
+        return RES_OK;
+    }
+    if (a) *a = 0; return RES_FAIL;
+}
 // SDK 21 (Star Fox): the IPv4 and IPv6 configurations at once, with their counts
 HLE_FORCE("_ZN2nn4nifm18GetCurrentIpConfigEPNS0_10Ipv4ConfigEPiPNS0_10Ipv6ConfigES3_ii", "offline: no IP configuration (SDK 21 overload)", Result, h_nifm_IpCfg21,
           void *v4, int *n4, void *v6, int *n6, int c4, int c6) { (void)v4; (void)v6; (void)c4; (void)c6; if (n4) *n4 = 0; if (n6) *n6 = 0; return RES_FAIL; }
@@ -162,15 +186,77 @@ HLE_FORCE("_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKDsm", "profani
 HLE_FORCE("_ZN2nn3ngc47CheckProfanityWordsInTextForPlatformRegionChinaEPbPKc", "China-region profanity check (ngct:u): no profanity", Result, h_ngc_CheckCn, uint8_t *out, const char *text) { (void)text; if (out) *out = 0; return RES_OK; }
 HLE_FORCE("_ZN2nn3ngc46MaskProfanityWordsInTextForPlatformRegionChinaEPc", "China-region profanity masking (ngct:u): nothing is masked", Result, h_ngc_MaskCn, char *text) { (void)text; return RES_OK; }
 
-// ---------- err: error display applet. Only logged, no UI is shown ----------
-HLE_FORCE("_ZN2nn3err9ShowErrorENS0_9ErrorCodeE", "error display applet; the host only logs it", void, h_err_ShowCode, uint64_t code) { DM_APPLET("error"); LOG("game asks to show an error: %04u-%04u", (unsigned)(code & 0xffffffff), (unsigned)(code >> 32)); }
-HLE_FORCE("_ZN2nn3err9ShowErrorERKNS0_18ErrorResultVariantE", "error display applet; the host only logs it", void, h_err_ShowVar, const void *v) { DM_APPLET("error"); (void)v; LOG("game asks to show an error (ErrorResultVariant)"); }
-HLE_FORCE("_ZN2nn3err40ShowUnacceptableAddOnContentVersionErrorEv", "add-on content version mismatch error applet; the host only logs it", void, h_err_AocVer, void) { DM_APPLET("error"); LOG("game asks to show an error: add-on content version mismatch"); }
-HLE_FORCE("_ZN2nn3err39ShowUnacceptableApplicationVersionErrorEv", "game version mismatch error applet; the host only logs it", void, h_err_AppVer, void) { DM_APPLET("error"); LOG("game asks to show an error: game version mismatch"); }
-// Pokémon Legends: Z-A (SDK 19): the application's own error screen (an error code number and two messages in the argument) goes through the error applet as well
-HLE_FORCE("_ZN2nn3err20ShowApplicationErrorERKNS0_19ApplicationErrorArgE", "application error applet; the host only logs it", void, h_err_ShowApp, const void *arg) { DM_APPLET("error"); (void)arg; LOG("game asks to show an application error (ApplicationErrorArg)"); }
-// Pokémon Sword (SDK 7.3.2): the error applet's network service form, after a failed online call
-HLE_FORCE("_ZN2nn3err23ShowNetworkServiceErrorENS0_9ErrorCodeE", "network service error applet; the host only logs it", void, h_err_ShowNet, uint64_t code) { DM_APPLET("error"); LOG("game asks to show a network service error: %04u-%04u", (unsigned)(code & 0xffffffff), (unsigned)(code >> 32)); }
+// ---------- err: error display applet ----------
+HLE_FORCE("_ZN2nn3err9ShowErrorENS0_9ErrorCodeE", "error display applet", void, h_err_ShowCode, uint64_t code) {
+    DM_APPLET("error");
+    unsigned c0 = (unsigned)(code & 0xffffffff);
+    unsigned c1 = (unsigned)(code >> 32);
+    char code_str[32];
+    if (c1 != 0) snprintf(code_str, sizeof(code_str), "%04u-%04u", c0, c1);
+    else snprintf(code_str, sizeof(code_str), "%04u", c0);
+    LOG("game asks to show an error: %s", code_str);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "An error occurred.\nError Code: %s", code_str);
+    front_error_dialog(code_str, msg);
+}
+HLE_FORCE("_ZN2nn3err9ShowErrorERKNS0_18ErrorResultVariantE", "error display applet", void, h_err_ShowVar, const void *v) {
+    DM_APPLET("error");
+    const uint32_t *words = (const uint32_t *)v;
+    char code_str[32] = {0};
+    if (words) {
+        LOG("game asks to show an error (ErrorResultVariant: %08x %08x %08x %08x)", words[0], words[1], words[2], words[3]);
+        uint32_t r = words[0];
+        if (r == 0 && words[1] != 0) r = words[1];
+        unsigned mod = r & 0x1ff;
+        unsigned desc = (r >> 9) & 0x1fff;
+        if (mod > 0 && mod < 500) {
+            snprintf(code_str, sizeof(code_str), "%04u-%04u", 2000 + mod, desc);
+        } else if (words[1] != 0) {
+            snprintf(code_str, sizeof(code_str), "%04u-%04u", words[0], words[1]);
+        } else {
+            snprintf(code_str, sizeof(code_str), "%04u", words[0]);
+        }
+    } else {
+        LOG("game asks to show an error (ErrorResultVariant: NULL)");
+        snprintf(code_str, sizeof(code_str), "2000-0000");
+    }
+    char msg[160];
+    snprintf(msg, sizeof(msg), "An error occurred.\nError Code: %s", code_str);
+    front_error_dialog(code_str, msg);
+}
+HLE_FORCE("_ZN2nn3err40ShowUnacceptableAddOnContentVersionErrorEv", "add-on content version mismatch error applet", void, h_err_AocVer, void) {
+    DM_APPLET("error");
+    LOG("game asks to show an error: add-on content version mismatch");
+    front_error_dialog("2164-0001", "The add-on content version does not match this software.");
+}
+HLE_FORCE("_ZN2nn3err39ShowUnacceptableApplicationVersionErrorEv", "game version mismatch error applet", void, h_err_AppVer, void) {
+    DM_APPLET("error");
+    LOG("game asks to show an error: game version mismatch");
+    front_error_dialog("2164-0002", "A software update is required.");
+}
+HLE_FORCE("_ZN2nn3err20ShowApplicationErrorERKNS0_19ApplicationErrorArgE", "application error applet", void, h_err_ShowApp, const void *arg) {
+    DM_APPLET("error");
+    LOG("game asks to show an application error (ApplicationErrorArg)");
+    char code_str[32] = "Application Error";
+    char msg[256] = "An application error has occurred.";
+    if (arg) {
+        const uint32_t *u = (const uint32_t *)arg;
+        if (u[0] != 0) snprintf(code_str, sizeof(code_str), "%04u", u[0]);
+    }
+    front_error_dialog(code_str, msg);
+}
+HLE_FORCE("_ZN2nn3err23ShowNetworkServiceErrorENS0_9ErrorCodeE", "network service error applet", void, h_err_ShowNet, uint64_t code) {
+    DM_APPLET("error");
+    unsigned c0 = (unsigned)(code & 0xffffffff);
+    unsigned c1 = (unsigned)(code >> 32);
+    char code_str[32];
+    if (c1 != 0) snprintf(code_str, sizeof(code_str), "%04u-%04u", c0, c1);
+    else snprintf(code_str, sizeof(code_str), "%04u", c0);
+    LOG("game asks to show a network service error: %s", code_str);
+    char msg[160];
+    snprintf(msg, sizeof(msg), "A network service error occurred.\nError Code: %s", code_str);
+    front_error_dialog(code_str, msg);
+}
 
 // ---------- pdm: the system's play log ----------
 // Pokémon Sword asks at boot how often this user has launched two other games (main+0xc88074, one ID each call, 0x18 bytes {application ID, play time, launch count} per entry; the result is
@@ -188,14 +274,14 @@ HLE_FORCE("_ZN2nn3web11ShowWebPageEPNS0_18WebPageReturnValueERKNS0_14ShowWebPage
 // Octopath Traveler 0 imports the offline HTML page applet too (pages shipped in the game's HTML document NCA, which the host does not extract)
 
 // ---------- C interface (nnsocket* / nnssl*): offline as well. The arguments are all in registers and the host does not look at them ----------
-HLE_FORCE("nnsocketAccept", "offline (cut)", int, h_c_sk_Accept, void) { return -1; }
-HLE_FORCE("nnsocketListen", "offline (cut)", int, h_c_sk_Listen, void) { return -1; }
+HLE_FORCE("nnsocketAccept", "accept connection (C API)", int, h_c_sk_Accept, int s, void *a, unsigned *n) { return dm_sk_accept(s, a, n); }
+HLE_FORCE("nnsocketListen", "listen on socket (C API)", int, h_c_sk_Listen, int s, int n) { return dm_sk_listen(s, n); }
 HLE_FORCE("nnsocketRecvMsg", "offline (cut)", int, h_c_sk_RecvMsg, void) { return -1; }
 HLE_FORCE("nnsocketSendMsg", "offline (cut)", int, h_c_sk_SendMsg, void) { return -1; }
 HLE_FORCE("nnsocketShutdown", "local UDP (offline BSD service)", int, h_c_sk_Shutdown, int s, int h) { return dm_sk_shutdown(s, h); }
-HLE_FORCE("nnsocketGetAddrInfoWithOptions", "name resolution with resolver options (cut): EAI_FAIL", int, h_c_sk_GaiOpt, const char *h, const char *s, const void *hint, void **res, const void *o, unsigned long n) { (void)h; (void)s; (void)hint; (void)o; (void)n; if (res) *res = NULL; return SK_EAI_FAIL; }
-HLE_FORCE("nnsocketGetAddrInfo", "name resolution (cut): EAI_FAIL", int, h_c_sk_Gai, const char *h, const char *s, const void *hint, void **res) { (void)h; (void)s; (void)hint; if (res) *res = NULL; return SK_EAI_FAIL; }
-HLE_FORCE("nnsocketFreeAddrInfo", "pairs with GetAddrInfo (cut)", void, h_c_sk_FreeAi, void *ai) { (void)ai; }
+HLE_FORCE("nnsocketGetAddrInfoWithOptions", "name resolution with resolver options", int, h_c_sk_GaiOpt, const char *h, const char *s, const void *hint, void **res, const void *o, unsigned long n) { (void)o; (void)n; return dm_sk_getaddrinfo(h, s, hint, res); }
+HLE_FORCE("nnsocketGetAddrInfo", "name resolution (C API)", int, h_c_sk_Gai, const char *h, const char *s, const void *hint, void **res) { return dm_sk_getaddrinfo(h, s, hint, res); }
+HLE_FORCE("nnsocketFreeAddrInfo", "pairs with GetAddrInfo (C API)", void, h_c_sk_FreeAi, void *ai) { dm_sk_freeaddrinfo(ai); }
 HLE_FORCE("nnsocketGAIStrError", "resolver error text", const char *, h_c_sk_GaiStr, int e) { (void)e; return "network unavailable"; }
 
 // ---------- bcat: news / data delivered from the server (Super Mario Odyssey). Initialize talks to the bcat service (an SDK abort without it); mounting the delivery cache fails,

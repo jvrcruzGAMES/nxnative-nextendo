@@ -138,9 +138,9 @@ struct LauncherView: View {
             }
             .padding([.horizontal, .top], 20)
             Form {
+                NextendoSection()
                 settingSections(basic: true)
                 CloudSavesSection()
-                NextendoSection()
                 Section {
                     DisclosureGroup("Advanced settings", isExpanded: $advanced) {}
                 }
