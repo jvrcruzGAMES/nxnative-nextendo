@@ -622,7 +622,14 @@ int dm_mii_standin(const char *dir);
 const char *dm_system_dir(char *buf, size_t n) { return envdir("DM_SYSTEM_DIR", "run/platform/system", buf, n); }
 static int sysdata_own(char *dir, size_t n, uint64_t id) {
     char t[1024]; const char *sys = dm_system_dir(t, sizeof t); struct stat st;
-    return *sys && snprintf(dir, n, "%s/sysdata/%016llx", sys, (unsigned long long)id) < (int)n && !stat(dir, &st) && S_ISDIR(st.st_mode);
+    if (!(*sys && snprintf(dir, n, "%s/sysdata/%016llx", sys, (unsigned long long)id) < (int)n && !stat(dir, &st) && S_ISDIR(st.st_mode)))
+        return 0;
+    if (id == SYSDATA_MIIMODEL || id == SYSDATA_MIIMODEL_SW2) {
+        char testpath[1024];
+        snprintf(testpath, sizeof testpath, "%s/ShapeMid.dat", dir);
+        if (stat(testpath, &st) != 0) return 0;
+    }
+    return 1;
 }
 static int sysdata_dir(char *dir, size_t n, uint64_t id) {
     char t[1024];

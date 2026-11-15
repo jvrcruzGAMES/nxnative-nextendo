@@ -45,13 +45,18 @@ int main(void) {
     assert(!strcmp(canon, "e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com"));
 
     // NAT redirect
-    r = nextendo_redirect_host("g2b309e01-lp1.s.n.srv.nintendo.net", ip, sizeof(ip), canon, sizeof(canon));
+    r = nextendo_redirect_host("nncs2-lp1.n.n.srv.nintendo.net", ip, sizeof(ip), canon, sizeof(canon));
     assert(r == 1);
     assert(!strcmp(ip, "164.132.111.120"));
 
     // Reverse lookup
     const char *last_host = nextendo_last_host_for_ip("164.132.111.120");
-    assert(last_host && !strcmp(last_host, "g2b309e01-lp1.s.n.srv.nintendo.net"));
+    assert(last_host && !strcmp(last_host, "nncs2-lp1.n.n.srv.nintendo.net"));
+
+    // MK8D NEX secure server -> Server IP
+    r = nextendo_redirect_host("g2b309e01-lp1.s.n.srv.nintendo.net", ip, sizeof(ip), canon, sizeof(canon));
+    assert(r == 1);
+    assert(!strcmp(ip, "51.178.29.194"));
 
     // JWT token generation
     char jwt[2048] = {0};

@@ -98,8 +98,15 @@ HLE_FORCE("_ZN2nn7account40ShowLicenseRequirementsForNetworkServiceERKNS0_10User
     (void)h; return nextendo_enabled() ? RES_OK : RES_FAIL;
 }
 // The Nintendo Account's cached profile (birthday, country): no Nintendo Account is linked on the host, so loading fails and the game skips its getters (Big Brain Academy: Brain vs. Brain, main+0xab8bc)
-HLE_FORCE("_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm", "cached Nintendo Account info: none linked, fails", Result, h_acc_LoadNaInfo,
-          void *info, const UserHandle *h, void *buf, uint64_t sz) { (void)info; (void)h; (void)buf; (void)sz; return RES_FAIL; }
+HLE_FORCE("_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm", "cached Nintendo Account info", Result, h_acc_LoadNaInfo,
+          void *info, const UserHandle *h, void *buf, uint64_t sz) {
+    (void)h; (void)buf; (void)sz;
+    if (nextendo_enabled()) {
+        if (info) memset(info, 0, 0x20);
+        return RES_OK;
+    }
+    return RES_FAIL;
+}
 
 // AsyncContext / NintendoAccountAuthorizationRequestContext:
 HLE_FORCE("_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE", "network service account token async", Result, h_acc_EnsureTokAsync, void *ctx, const UserHandle *h) {

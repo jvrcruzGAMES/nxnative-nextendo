@@ -500,10 +500,9 @@ int nextendo_redirect_host(const char *host, char *out_ip, size_t out_sz, char *
 
     const char *target_ip = NULL;
 
-    // NAT test responders and game-specific NAT bindings
-    if (wildcard_match("nncs2-*.n.n.srv.nintendo.net", eff_host) ||
-        strcasecmp(eff_host, "g2b309e01-lp1.s.n.srv.nintendo.net") == 0 || // Mario Kart 8 Deluxe
-        strcasecmp(eff_host, "g2df33d01-lp1.p.srv.nintendo.net") == 0) {   // Splatoon 2 rendezvous
+    // NAT test responders
+    if (wildcard_match("nncs1-*.n.n.srv.nintendo.net", eff_host) ||
+        wildcard_match("nncs2-*.n.n.srv.nintendo.net", eff_host)) {
         target_ip = s_nat_ip;
     }
     // Nintendo server domain wildcards

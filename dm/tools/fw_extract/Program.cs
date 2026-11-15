@@ -67,23 +67,27 @@ static class Program {
                     var nca = new Nca(ks, st);
                     ulong tid = nca.Header.TitleId;
 
+                    if (nca.Header.ContentType == NcaContentType.Meta) {
+                        continue; // Skip CNMT metadata NCAs
+                    }
+
                     if (tid == 0x0100000000000802UL) {
                         // MiiModel / MiiResource
                         if (nca.CanOpenSection(NcaSectionType.Data)) {
                             IFileSystem romfs = nca.OpenFileSystem(NcaSectionType.Data, IntegrityCheckLevel.IgnoreOnInvalid);
                             string dst = Path.Combine(outDir, "sysdata", $"{tid:x16}");
                             Directory.CreateDirectory(dst);
-                            CopyDirectory(romfs, "/", dst);
+                            CopyFileSystem(romfs, dst);
                             Console.WriteLine($"[firmware] extracted MiiModel ({tid:x16}) to {dst}");
                             extractedCount++;
                         }
-                    } else if (tid == 0x0100000000000810UL || tid == 0x0100000000000811UL) {
+                    } else if (tid >= 0x0100000000000810UL && tid <= 0x0100000000000814UL) {
                         // SharedFont
                         if (nca.CanOpenSection(NcaSectionType.Data)) {
                             IFileSystem romfs = nca.OpenFileSystem(NcaSectionType.Data, IntegrityCheckLevel.IgnoreOnInvalid);
                             string dst = Path.Combine(outDir, "sysdata", $"{tid:x16}");
                             Directory.CreateDirectory(dst);
-                            CopyDirectory(romfs, "/", dst);
+                            CopyFileSystem(romfs, dst);
                             Console.WriteLine($"[firmware] extracted SharedFont ({tid:x16}) to {dst}");
 
                             string fontDir = Path.Combine(outDir, "font");
@@ -97,11 +101,11 @@ static class Program {
                         Directory.CreateDirectory(appletDir);
                         if (nca.CanOpenSection(NcaSectionType.Data)) {
                             IFileSystem romfs = nca.OpenFileSystem(NcaSectionType.Data, IntegrityCheckLevel.IgnoreOnInvalid);
-                            CopyDirectory(romfs, "/", Path.Combine(appletDir, "RomFS"));
+                            CopyFileSystem(romfs, Path.Combine(appletDir, "RomFS"));
                         }
                         if (nca.CanOpenSection(NcaSectionType.Code)) {
                             IFileSystem exefs = nca.OpenFileSystem(NcaSectionType.Code, IntegrityCheckLevel.IgnoreOnInvalid);
-                            CopyDirectory(exefs, "/", Path.Combine(appletDir, "ExeFS"));
+                            CopyFileSystem(exefs, Path.Combine(appletDir, "ExeFS"));
                         }
                         Console.WriteLine($"[firmware] extracted MiiEdit ({tid:x16}) to {appletDir}");
                         extractedCount++;
@@ -111,7 +115,7 @@ static class Program {
                             IFileSystem romfs = nca.OpenFileSystem(NcaSectionType.Data, IntegrityCheckLevel.IgnoreOnInvalid);
                             string dst = Path.Combine(outDir, "sysdata", $"{tid:x16}");
                             Directory.CreateDirectory(dst);
-                            CopyDirectory(romfs, "/", dst);
+                            CopyFileSystem(romfs, dst);
                             Console.WriteLine($"[firmware] extracted TimeZoneBinary ({tid:x16}) to {dst}");
                             extractedCount++;
                         }
@@ -133,15 +137,17 @@ static class Program {
         }
     }
 
-    static void CopyDirectory(IFileSystem fs, string srcDir, string dstDir) {
+    static void CopyFileSystem(IFileSystem fs, string dstDir) {
         Directory.CreateDirectory(dstDir);
-        foreach (DirectoryEntryEx entry in fs.EnumerateEntries(srcDir, SearchOptions.Default)) {
-            string dstPath = Path.Combine(dstDir, entry.Name);
-            if (entry.Type == DirectoryEntryType.Directory) {
-                CopyDirectory(fs, entry.FullPath, dstPath);
-            } else if (entry.Type == DirectoryEntryType.File) {
+        foreach (DirectoryEntryEx e in fs.EnumerateEntries("*", SearchOptions.RecurseSubdirectories)) {
+            string relPath = e.FullPath.TrimStart('/');
+            string dstPath = Path.Combine(dstDir, relPath);
+            if (e.Type == DirectoryEntryType.Directory) {
+                Directory.CreateDirectory(dstPath);
+            } else if (e.Type == DirectoryEntryType.File) {
+                Directory.CreateDirectory(Path.GetDirectoryName(dstPath)!);
                 using var file = new UniqueRef<IFile>();
-                if (fs.OpenFile(ref file.Ref, entry.FullPath.ToU8Span(), OpenMode.Read).IsSuccess()) {
+                if (fs.OpenFile(ref file.Ref, e.FullPath.ToU8Span(), OpenMode.Read).IsSuccess()) {
                     using var stream = file.Release().AsStream();
                     using var outStream = File.Create(dstPath);
                     stream.CopyTo(outStream);
@@ -151,22 +157,33 @@ static class Program {
     }
 
     static void DecryptSharedFonts(string sysDataDir, string fontDir) {
-        var map = new Dictionary<string, string> {
-            { "nintendo_udsg-r_std.bfttf", "standard.ttf" },
-            { "nintendo_ext_003.bfttf", "nintendo_ext.ttf" },
-            { "nintendo_ext.bfttf", "nintendo_ext.ttf" },
-            { "nintendo_udsg-r_org_zh-cn.bfttf", "chinese_simplified.ttf" },
-            { "nintendo_udsg-r_ext_zh-cn.bfttf", "chinese_simplified_ext.ttf" },
-            { "nintendo_udjxh-db_zh-tw.bfttf", "chinese_traditional.ttf" },
-            { "nintendo_udsg-r_ko.bfttf", "korean.ttf" }
-        };
+        if (!Directory.Exists(sysDataDir)) return;
+        var files = Directory.GetFiles(sysDataDir, "*", SearchOption.AllDirectories);
 
-        foreach (var (srcName, dstName) in map) {
-            string srcFile = Path.Combine(sysDataDir, srcName);
-            if (File.Exists(srcFile)) {
+        foreach (var srcFile in files) {
+            string name = Path.GetFileName(srcFile).ToLowerInvariant();
+            string dstName = null;
+
+            if (name.Contains("_std")) {
+                dstName = "standard.ttf";
+            } else if (name.Contains("zh-cn") && name.Contains("org")) {
+                dstName = "chinese_simplified.ttf";
+            } else if (name.Contains("zh-cn") && name.Contains("ext")) {
+                dstName = "chinese_simplified_ext.ttf";
+            } else if (name.Contains("zh-tw")) {
+                dstName = "chinese_traditional.ttf";
+            } else if (name.Contains("_ko")) {
+                dstName = "korean.ttf";
+            } else if (name.Contains("_ext2")) {
+                dstName = "nintendo_ext2.ttf";
+            } else if (name.Contains("_ext")) {
+                dstName = "nintendo_ext.ttf";
+            }
+
+            if (dstName != null) {
                 string dstFile = Path.Combine(fontDir, dstName);
                 DecryptBfttf(srcFile, dstFile);
-                Console.WriteLine($"[firmware] decrypted font {srcName} -> {dstName}");
+                Console.WriteLine($"[firmware] decrypted font {Path.GetFileName(srcFile)} -> {dstName}");
             }
         }
     }

@@ -180,8 +180,30 @@ static int boot_env(void) {
     setenv("DM_TEMP", [doc stringByAppendingPathComponent:@"temp"].fileSystemRepresentation, 0);
     NSString *doc_sys = [doc stringByAppendingPathComponent:@"system"];
     NSString *bundle_sys = [[res stringByAppendingPathComponent:@"dm"] stringByAppendingPathComponent:@"system"];
-    if ([fm fileExistsAtPath:bundle_sys] && ![fm fileExistsAtPath:doc_sys]) {
-        [fm copyItemAtPath:bundle_sys toPath:doc_sys error:nil];
+    if ([fm fileExistsAtPath:bundle_sys]) {
+        if (![fm fileExistsAtPath:doc_sys]) {
+            [fm copyItemAtPath:bundle_sys toPath:doc_sys error:nil];
+        } else {
+            // Update bundle_sys contents into doc_sys so new/fixed firmware system data is reflected
+            NSDirectoryEnumerator *e = [fm enumeratorAtPath:bundle_sys];
+            NSString *sub;
+            while ((sub = [e nextObject])) {
+                NSString *src = [bundle_sys stringByAppendingPathComponent:sub];
+                NSString *dst = [doc_sys stringByAppendingPathComponent:sub];
+                BOOL isDir = NO;
+                if ([fm fileExistsAtPath:src isDirectory:&isDir]) {
+                    if (isDir) {
+                        [fm createDirectoryAtPath:dst withIntermediateDirectories:YES attributes:nil error:nil];
+                    } else {
+                        NSDictionary *st = [fm attributesOfItemAtPath:dst error:nil];
+                        if (!st || [st fileSize] == 0) {
+                            [fm removeItemAtPath:dst error:nil];
+                            [fm copyItemAtPath:src toPath:dst error:nil];
+                        }
+                    }
+                }
+            }
+        }
     }
     setenv("DM_SYSTEM_DIR", doc_sys.fileSystemRepresentation, 0);
     setenv("DM_GUEST_FILE_DIR", NSTemporaryDirectory().fileSystemRepresentation, 0);   // DM_GUEST_FILE (hle_svc.c) keeps the guest's memory in files there
