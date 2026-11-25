@@ -3463,7 +3463,7 @@ def parse_args(argv):
     ap.add_argument('--no-heap-check', action='store_true', help='a provisional profile: skip the heap check and the address region check on the Mac (the alias / heap split stays a guess); a derived profile: skip the address region check')
     ap.add_argument('--progress', choices=('auto', 'bar', 'lines', 'json', 'off'), help='stage lines on the console: bar = one line per stage, redrawn in place; lines = a plain line every BEAT seconds; json = newline-delimited JSON events (no prompts); off = only each stage\'s start and end '
                     '(default: the PROGRESS setting; auto = bar in a terminal or Spyder, lines when the output goes to a file or a pipe)')
-    ap.add_argument('--nxshare', action='store_true', help=argparse.SUPPRESS)
+    ap.add_argument('--nxshare', nargs='?', const=1, type=int, choices=(1, 2), default=0, help=argparse.SUPPRESS)
     return ap.parse_args(argv)
 
 
@@ -3644,8 +3644,8 @@ def reconcile_provisional_marker(g, rom):
     return type(g)(g.dir)
 
 
-def pack_nxshare_zip(out_zip, slim_ipa, info_path, romfs_path, icon, aoc, say):
-    import zipfile
+def pack_nxshare_zip(out_zip, slim_ipa, info_path, romfs_path, icon, aoc, say, nxshare_version=1):
+    import tarfile, zipfile
     info = json.loads(info_path.read_text())
     doc_entries = []   # (src_path, rel_path_under_Documents)
     def add_tree(src, dst_rel):
@@ -3694,6 +3694,7 @@ def pack_nxshare_zip(out_zip, slim_ipa, info_path, romfs_path, icon, aoc, say):
             icon_jpg = tmp_icon
 
     manifest = {
+        'nxshareVersion': nxshare_version,
         'titleId': info['titleId'],
         'name': info['name'],
         'version': info['version'],
@@ -3708,6 +3709,36 @@ def pack_nxshare_zip(out_zip, slim_ipa, info_path, romfs_path, icon, aoc, say):
     if icon_jpg:
         manifest['iconFile'] = 'icon.jpg'
 
+    tmp_archive = None
+    if nxshare_version == 2:
+        sevenz = shutil.which('7z') or shutil.which('7za') or shutil.which('7zz')
+        if not sevenz:
+            for cand in ('/opt/homebrew/bin/7z', '/usr/local/bin/7z'):
+                if Path(cand).is_file():
+                    sevenz = cand
+                    break
+        if not sevenz:
+            raise BuildError('--nxshare 2 requires 7z (p7zip / sevenzip) to compress Documents.archive')
+        tmp_archive = slim_ipa.parent / 'Documents.archive'
+        if tmp_archive.exists(): tmp_archive.unlink()
+        say(f'compressing Documents.archive with 7zip LZMA ({len(doc_entries)} files, {doc_total / 2**30:.2f} GB)…')
+        proc = subprocess.Popen([sevenz, 'a', '-si', '-txz', '-mmt=on', str(tmp_archive)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            with tarfile.open(fileobj=proc.stdin, mode='w|', format=tarfile.PAX_FORMAT) as tf:
+                for src, rel in doc_entries:
+                    tf.add(src, arcname=rel, recursive=False)
+            proc.stdin.close()
+            out_b, err_b = proc.communicate()
+            if proc.returncode != 0:
+                raise BuildError(f'7z failed ({proc.returncode}): {(err_b or out_b).decode(errors="replace")[-1000:]}')
+        except Exception:
+            proc.kill()
+            proc.wait()
+            if tmp_archive.exists(): tmp_archive.unlink()
+            raise
+        manifest['archiveFile'] = 'Documents.archive'
+        manifest['archiveSize'] = tmp_archive.stat().st_size
+
     partial = out_zip.with_name(out_zip.name + '.partial')
     if partial.exists(): partial.unlink()
     say(f'packing nxshare bundle → {out_zip} ({len(doc_entries)} Documents files, {doc_total / 2**30:.2f} GB)')
@@ -3717,11 +3748,15 @@ def pack_nxshare_zip(out_zip, slim_ipa, info_path, romfs_path, icon, aoc, say):
             zf.writestr('manifest.json', json.dumps(manifest, indent=2) + '\n')
             if icon_jpg:
                 zf.write(icon_jpg, 'icon.jpg')
-            for src, rel in doc_entries:
-                zf.write(src, f'Documents/{rel}')
+            if nxshare_version == 2:
+                zf.write(tmp_archive, 'Documents.archive')
+            else:
+                for src, rel in doc_entries:
+                    zf.write(src, f'Documents/{rel}')
         partial.replace(out_zip)
     finally:
         if tmp_icon and tmp_icon.exists(): tmp_icon.unlink()
+        if tmp_archive and tmp_archive.exists(): tmp_archive.unlink()
         if partial.exists(): partial.unlink()
 
 
@@ -4158,7 +4193,7 @@ def _main(args, cleanup):
     run(['bash', repo / 'dm/ios/tools/build_ipa.sh', slim_ipa if nxshare else out_ipa], logs / 'build_ipa.log', env=ipa_env, on_line=watch.line)
     if nxshare:
         if not slim_ipa.is_file(): raise BuildError(f'no IPA at {slim_ipa}')
-        pack_nxshare_zip(out_zip, slim_ipa, work / 'ipa/build/ios/pkg/nxshare_info.json', Path(romfs), icon, aoc, say)
+        pack_nxshare_zip(out_zip, slim_ipa, work / 'ipa/build/ios/pkg/nxshare_info.json', Path(romfs), icon, aoc, say, nxshare_version=nxshare)
         tree_tar.pack(xcode_data, say)
         PROG.end(f'{out_zip.name}, {amount(out_zip.stat().st_size, "B")}')
         rmtree(work / 'tmp')
