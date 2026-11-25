@@ -8,6 +8,7 @@ private struct NxShareFile: Decodable {
     let path: String
     let size: Int64
     let uncompressedSize: Int64?
+    let compression: String?
     let url: String
 }
 
@@ -251,7 +252,8 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
     private var activeFileDestination: URL?
     private var activeFileExpectedSize: Int64 = 0
     private var activeIsArchive: Bool = false
-    private var activeIsPerFileLZMA: Bool = false
+    private var activeIsPerFileCompressed: Bool = false
+    private var activeCompression: String = "lzma"
     private var activeFinalDestination: URL?
     private var pendingFiles: [NxShareFile] = []
     private var onComplete: (() -> Void)?
@@ -361,11 +363,11 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
 
         if manifest.nxshareVersion == 2, let archive = manifest.archive {
             activeIsArchive = true
-            activeIsPerFileLZMA = false
+            activeIsPerFileCompressed = false
             pendingFiles = [archive]
         } else {
             activeIsArchive = false
-            activeIsPerFileLZMA = (manifest.nxshareVersion == 3)
+            activeIsPerFileCompressed = (manifest.nxshareVersion == 3)
             pendingFiles = manifest.files ?? []
         }
         downloadNextFile()
@@ -386,14 +388,15 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
 
         let file = pendingFiles.removeFirst()
         let finalDest = documentsDirectory().appendingPathComponent(file.path)
+        let codec = (file.compression ?? (file.url.hasSuffix(".zst") ? "zstd" : "lzma")).lowercased()
         let dest = activeIsArchive
             ? FileManager.default.temporaryDirectory.appendingPathComponent("Documents.archive")
-            : activeIsPerFileLZMA
-            ? FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".xz")
+            : activeIsPerFileCompressed
+            ? FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + (codec == "zstd" ? ".zst" : ".xz"))
             : finalDest
         let fm = FileManager.default
 
-        let expectedOnDisk = activeIsPerFileLZMA ? (file.uncompressedSize ?? file.size) : file.size
+        let expectedOnDisk = activeIsPerFileCompressed ? (file.uncompressedSize ?? file.size) : file.size
         if !activeIsArchive,
            let attrs = try? fm.attributesOfItem(atPath: finalDest.path),
            let existingSize = attrs[.size] as? Int64,
@@ -420,6 +423,7 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
             self.currentFileName = file.path
             self.activeFileDestination = dest
             self.activeFinalDestination = finalDest
+            self.activeCompression = codec
             self.activeFileExpectedSize = file.size
         }
 
@@ -450,9 +454,13 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
                 let fh = try FileHandle(forReadingFrom: archiveURL)
                 defer { try? fh.close() }
                 while true {
-                    let chunk = try fh.read(upToCount: 1024 * 1024) ?? Data()
-                    if chunk.isEmpty { break }
-                    try filter.write(chunk)
+                    let stop = try autoreleasepool { () -> Bool in
+                        let chunk = try fh.read(upToCount: 1024 * 1024) ?? Data()
+                        if chunk.isEmpty { return true }
+                        try filter.write(chunk)
+                        return false
+                    }
+                    if stop { break }
                 }
                 try filter.finalize()
                 try extractor.finish()
@@ -468,32 +476,44 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
         }
     }
 
-    private func decompressSingleFile(from xzURL: URL, to finalURL: URL, compressedSize: Int64) {
+    private func decompressSingleFile(from srcURL: URL, to finalURL: URL, codec: String, compressedSize: Int64) {
         DispatchQueue.global(qos: .userInitiated).async {
             let fm = FileManager.default
-            defer { try? fm.removeItem(at: xzURL) }
+            defer { try? fm.removeItem(at: srcURL) }
             do {
                 try fm.createDirectory(at: finalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
                 if fm.fileExists(atPath: finalURL.path) {
                     try fm.removeItem(at: finalURL)
                 }
-                fm.createFile(atPath: finalURL.path, contents: nil)
-                let outFH = try FileHandle(forWritingTo: finalURL)
-                defer { try? outFH.close() }
-                let filter = try OutputFilter(.decompress, using: .lzma) { (data: Data?) in
-                    if let data, !data.isEmpty {
-                        try outFH.write(contentsOf: data)
+                if codec == "zstd" {
+                    var errBuf = [CChar](repeating: 0, count: 256)
+                    let rc = dm_zstd_decompress_file(srcURL.path, finalURL.path, &errBuf, errBuf.count)
+                    if rc != 0 {
+                        let msg = String(cString: errBuf)
+                        throw NSError(domain: "NxShareZstd", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: msg.isEmpty ? "zstd decompression failed" : msg])
                     }
+                } else {
+                    fm.createFile(atPath: finalURL.path, contents: nil)
+                    let outFH = try FileHandle(forWritingTo: finalURL)
+                    defer { try? outFH.close() }
+                    let filter = try OutputFilter(.decompress, using: .lzma) { (data: Data?) in
+                        if let data, !data.isEmpty {
+                            try outFH.write(contentsOf: data)
+                        }
+                    }
+                    let inFH = try FileHandle(forReadingFrom: srcURL)
+                    defer { try? inFH.close() }
+                    while true {
+                        let stop = try autoreleasepool { () -> Bool in
+                            let chunk = try inFH.read(upToCount: 1024 * 1024) ?? Data()
+                            if chunk.isEmpty { return true }
+                            try filter.write(chunk)
+                            return false
+                        }
+                        if stop { break }
+                    }
+                    try filter.finalize()
                 }
-                let inFH = try FileHandle(forReadingFrom: xzURL)
-                defer { try? inFH.close() }
-                while true {
-                    let chunk = try inFH.read(upToCount: 1024 * 1024) ?? Data()
-                    if chunk.isEmpty { break }
-                    try filter.write(chunk)
-                }
-                try filter.finalize()
-                try outFH.close()
                 var values = URLResourceValues()
                 values.isExcludedFromBackup = true
                 var mutableDest = finalURL
@@ -529,8 +549,8 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
                 decompressArchive(at: dest)
                 return
             }
-            if activeIsPerFileLZMA, let finalDest = activeFinalDestination {
-                decompressSingleFile(from: dest, to: finalDest, compressedSize: activeFileExpectedSize)
+            if activeIsPerFileCompressed, let finalDest = activeFinalDestination {
+                decompressSingleFile(from: dest, to: finalDest, codec: activeCompression, compressedSize: activeFileExpectedSize)
                 return
             }
             var values = URLResourceValues()

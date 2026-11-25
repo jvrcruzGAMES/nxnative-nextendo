@@ -335,7 +335,15 @@ void front_ios_boot(void) {   // Called by front_ios.m once the window and Metal
     pthread_t t; pthread_create(&t, &a, boot_thread, NULL); pthread_detach(t);
 }
 int front_ios_boot_ok(void) { return g_boot_ok; }
-int front_ios_reload_boot_env(void) { g_boot_ok = boot_env(); return g_boot_ok; }
+int front_ios_reload_boot_env(void) {
+    unsetenv("DM_ROMFS");
+    unsetenv("DM_MSL_DIR");
+    unsetenv("DM_AOC_DIR");
+    unsetenv("DM_PSO_BUNDLE");
+    unsetenv("DM_ROMFS_PROGRAMS");
+    g_boot_ok = boot_env();
+    return g_boot_ok;
+}
 
 @interface App : UIResponder <UIApplicationDelegate>
 @end

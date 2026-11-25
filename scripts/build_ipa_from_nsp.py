@@ -3741,21 +3741,79 @@ def pack_nxshare_zip(out_zip, slim_ipa, info_path, romfs_path, icon, aoc, say, n
         manifest['archiveFile'] = 'Documents.archive'
         manifest['archiveSize'] = tmp_archive.stat().st_size
     elif nxshare_version == 3:
+        zstd_bin = shutil.which('zstd')
+        if not zstd_bin:
+            for cand in ('/opt/homebrew/bin/zstd', '/usr/local/bin/zstd'):
+                if Path(cand).is_file():
+                    zstd_bin = cand
+                    break
         tmp_v3_dir = slim_ipa.parent / 'nxshare_v3_tmp'
         if tmp_v3_dir.exists(): shutil.rmtree(tmp_v3_dir)
         tmp_v3_dir.mkdir(parents=True, exist_ok=True)
-        say(f'compressing {len(doc_entries)} Documents files individually with 7zip LZMA ({doc_total / 2**30:.2f} GB)…')
+        say(f'compressing {len(doc_entries)} Documents files individually (auto zstd-19 / 7zip LZMA, {doc_total / 2**30:.2f} GB)…')
         v3_entries = []
         v3_files_meta = []
+
+        def choose_v3_codec(src_path, raw_size):
+            if not zstd_bin or raw_size == 0:
+                return 'lzma'
+            sample_max = 4 * 1024 * 1024
+            with open(src_path, 'rb') as f:
+                if raw_size <= sample_max:
+                    sample = f.read()
+                else:
+                    f.seek(raw_size // 3)
+                    sample = f.read(sample_max)
+            if not sample:
+                return 'lzma'
+            t0 = time.monotonic()
+            z_comp = subprocess.run([zstd_bin, '-19', '-T0', '-c', '-'], input=sample, capture_output=True)
+            t1 = time.monotonic()
+            if z_comp.returncode != 0:
+                return 'lzma'
+            tz0 = time.monotonic()
+            z_dec = subprocess.run([zstd_bin, '-d', '-c', '-'], input=z_comp.stdout, capture_output=True)
+            tz1 = time.monotonic()
+            z_ratio = len(z_comp.stdout) / len(sample)
+            z_dec_bps = len(sample) / max(1e-4, tz1 - tz0)
+
+            l0 = time.monotonic()
+            l_comp = subprocess.run([sevenz, 'a', '-si', '-txz', '-mmt=on', '-so'], input=sample, capture_output=True)
+            l1 = time.monotonic()
+            if l_comp.returncode != 0:
+                return 'zstd'
+            tl0 = time.monotonic()
+            l_dec = subprocess.run([sevenz, 'x', '-si', '-txz', '-so'], input=l_comp.stdout, capture_output=True)
+            tl1 = time.monotonic()
+            l_ratio = len(l_comp.stdout) / len(sample)
+            l_dec_bps = len(sample) / max(1e-4, tl1 - tl0)
+
+            # Balance compressed download size (~12 MB/s mobile Wi-Fi) against decompression speed
+            est_net_bps = 12.0 * 1024.0 * 1024.0
+            z_cost = (raw_size * z_ratio) / est_net_bps + (raw_size / z_dec_bps)
+            l_cost = (raw_size * l_ratio) / est_net_bps + (raw_size / l_dec_bps)
+            _ = (t1 - t0, l1 - l0, z_dec.returncode, l_dec.returncode)
+            return 'zstd' if z_cost <= l_cost else 'lzma'
+
         for idx, (src, rel) in enumerate(doc_entries):
-            xz_out = tmp_v3_dir / f'{idx}.xz'
-            with open(src, 'rb') as fin:
-                res = subprocess.run([sevenz, 'a', '-si', '-txz', '-mmt=on', str(xz_out)], stdin=fin, capture_output=True)
-            if res.returncode != 0:
-                raise BuildError(f'7z failed on {rel} ({res.returncode}): {(res.stderr or res.stdout).decode(errors="replace")[-1000:]}')
-            csize = xz_out.stat().st_size
-            v3_entries.append((xz_out, f'{rel}.xz'))
-            v3_files_meta.append({'path': rel, 'size': src.stat().st_size, 'compressedSize': csize, 'archivePath': f'{rel}.xz'})
+            raw_size = src.stat().st_size
+            codec = choose_v3_codec(src, raw_size)
+            if codec == 'zstd':
+                out_comp = tmp_v3_dir / f'{idx}.zst'
+                res = subprocess.run([zstd_bin, '-19', '-T0', '-q', '-f', str(src), '-o', str(out_comp)], capture_output=True)
+                if res.returncode != 0:
+                    raise BuildError(f'zstd failed on {rel} ({res.returncode}): {(res.stderr or res.stdout).decode(errors="replace")[-1000:]}')
+                arc_rel = f'{rel}.zst'
+            else:
+                out_comp = tmp_v3_dir / f'{idx}.xz'
+                with open(src, 'rb') as fin:
+                    res = subprocess.run([sevenz, 'a', '-si', '-txz', '-mmt=on', str(out_comp)], stdin=fin, capture_output=True)
+                if res.returncode != 0:
+                    raise BuildError(f'7z failed on {rel} ({res.returncode}): {(res.stderr or res.stdout).decode(errors="replace")[-1000:]}')
+                arc_rel = f'{rel}.xz'
+            csize = out_comp.stat().st_size
+            v3_entries.append((out_comp, arc_rel))
+            v3_files_meta.append({'path': rel, 'size': raw_size, 'compressedSize': csize, 'compression': codec, 'archivePath': arc_rel})
         manifest['files'] = v3_files_meta
         manifest['compressedSize'] = sum(f['compressedSize'] for f in v3_files_meta)
 
