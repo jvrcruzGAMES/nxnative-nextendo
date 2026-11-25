@@ -69,6 +69,117 @@ static NSString *mac_auth_path(void) {
 }
 #endif
 
+static int write_auth_dict(NSDictionary *dict) {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
+    if (!data) return 0;
+
+#if TARGET_OS_IPHONE
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: @"network.nextendo.auth",
+        (__bridge id)kSecAttrAccount: @"session"
+    };
+    SecItemDelete((__bridge CFDictionaryRef)query);
+
+    NSMutableDictionary *attrs = [query mutableCopy];
+    attrs[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
+    attrs[(__bridge id)kSecValueData] = data;
+
+    OSStatus st = SecItemAdd((__bridge CFDictionaryRef)attrs, NULL);
+    return (st == errSecSuccess) ? 1 : 0;
+#else
+    NSString *path = mac_auth_path();
+    NSString *dir = [path stringByDeletingLastPathComponent];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    if (![data writeToFile:path options:NSDataWritingAtomic error:nil]) return 0;
+    [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0600} ofItemAtPath:path error:nil];
+    return 1;
+#endif
+}
+
+static NSDictionary *sync_http_json(NSURLRequest *req) {
+    __block NSData *respData = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        if (!err && data) respData = data;
+        dispatch_semaphore_signal(sem);
+    }];
+    [task resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+    if (!respData) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:respData options:0 error:nil];
+    return [obj isKindOfClass:[NSDictionary class]] ? (NSDictionary *)obj : nil;
+}
+
+static void nextendo_try_refresh_locked(NSString *refreshToken, NSDictionary *origDict) {
+    if (!refreshToken.length) return;
+    NSString *base = [NSString stringWithUTF8String:s_api_url[0] ? s_api_url : "https://nextendo.network"];
+    if ([base hasSuffix:@"/"]) base = [base substringToIndex:base.length - 1];
+    NSString *cid = [NSString stringWithUTF8String:s_client_id];
+
+    NSURL *tokURL = [NSURL URLWithString:[base stringByAppendingString:@"/api/oauth/token"]];
+    if (!tokURL) return;
+    NSMutableURLRequest *tokReq = [NSMutableURLRequest requestWithURL:tokURL];
+    tokReq.HTTPMethod = @"POST";
+    [tokReq setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    [tokReq setValue:cid forHTTPHeaderField:@"X-Nextendo-Client-Id"];
+    [tokReq setValue:@"nxnative/1.0" forHTTPHeaderField:@"User-Agent"];
+
+    NSCharacterSet *allowed = [NSCharacterSet URLQueryAllowedCharacterSet];
+    NSString *body = [NSString stringWithFormat:@"grant_type=refresh_token&refresh_token=%@&client_id=%@",
+                      [refreshToken stringByAddingPercentEncodingWithAllowedCharacters:allowed] ?: refreshToken,
+                      [cid stringByAddingPercentEncodingWithAllowedCharacters:allowed] ?: cid];
+    tokReq.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+
+    NSDictionary *tokJson = sync_http_json(tokReq);
+    NSString *accessToken = tokJson[@"access_token"] ?: tokJson[@"token"];
+    if (![accessToken isKindOfClass:[NSString class]] || !accessToken.length) {
+        LOG("[Nextendo] Refresh token exchange failed");
+        return;
+    }
+    NSString *newRefresh = ([tokJson[@"refresh_token"] isKindOfClass:[NSString class]] && [tokJson[@"refresh_token"] length])
+        ? tokJson[@"refresh_token"] : refreshToken;
+
+    NSURL *nexURL = [NSURL URLWithString:[base stringByAppendingString:@"/api/nex-token"]];
+    if (!nexURL) return;
+    NSMutableURLRequest *nexReq = [NSMutableURLRequest requestWithURL:nexURL];
+    [nexReq setValue:[NSString stringWithFormat:@"Bearer %@", accessToken] forHTTPHeaderField:@"Authorization"];
+    [nexReq setValue:cid forHTTPHeaderField:@"X-Nextendo-Client-Id"];
+    [nexReq setValue:@"nxnative/1.0" forHTTPHeaderField:@"User-Agent"];
+
+    NSDictionary *nexJson = sync_http_json(nexReq);
+    NSString *nexTok = nexJson[@"nex_token"];
+    if (![nexTok isKindOfClass:[NSString class]] || !nexTok.length) {
+        LOG("[Nextendo] /api/nex-token failed after refresh");
+        return;
+    }
+
+    strncpy(s_token, [nexTok UTF8String], sizeof(s_token) - 1);
+    s_token[sizeof(s_token) - 1] = '\0';
+
+    if ([nexJson[@"username"] isKindOfClass:[NSString class]] && [nexJson[@"username"] length]) {
+        strncpy(s_username, [nexJson[@"username"] UTF8String], sizeof(s_username) - 1);
+        s_username[sizeof(s_username) - 1] = '\0';
+    }
+    if ([nexJson[@"friend_code"] isKindOfClass:[NSString class]] && [nexJson[@"friend_code"] length]) {
+        strncpy(s_friend_code, [nexJson[@"friend_code"] UTF8String], sizeof(s_friend_code) - 1);
+        s_friend_code[sizeof(s_friend_code) - 1] = '\0';
+    }
+    id pidVal = nexJson[@"pid"];
+    if ([pidVal isKindOfClass:[NSNumber class]]) s_pid = [pidVal unsignedLongLongValue];
+    else if ([pidVal isKindOfClass:[NSString class]]) s_pid = strtoull([pidVal UTF8String], NULL, 0);
+
+    NSMutableDictionary *updated = origDict ? [origDict mutableCopy] : [NSMutableDictionary dictionary];
+    updated[@"token"] = nexTok;
+    updated[@"username"] = [NSString stringWithUTF8String:s_username];
+    updated[@"pid"] = @(s_pid ? s_pid : 0xcafe);
+    updated[@"refresh_token"] = newRefresh;
+    updated[@"nex_token_at"] = @([[NSDate date] timeIntervalSince1970]);
+    if (s_friend_code[0]) updated[@"friend_code"] = [NSString stringWithUTF8String:s_friend_code];
+    write_auth_dict(updated);
+    LOG("[Nextendo] Refreshed NEX token for user='%s' pid=%llu", s_username, s_pid);
+}
+
 int nextendo_keychain_save(const char *token, const char *username, uint64_t pid) {
     if (!token || !*token) return 0;
     @autoreleasepool {
@@ -77,31 +188,7 @@ int nextendo_keychain_save(const char *token, const char *username, uint64_t pid
             @"username": [NSString stringWithUTF8String:username ? username : "Player"],
             @"pid": @(pid ? pid : 0xcafe)
         };
-        NSData *data = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
-        if (!data) return 0;
-
-#if TARGET_OS_IPHONE
-        NSDictionary *query = @{
-            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-            (__bridge id)kSecAttrService: @"network.nextendo.auth",
-            (__bridge id)kSecAttrAccount: @"session"
-        };
-        SecItemDelete((__bridge CFDictionaryRef)query);
-
-        NSMutableDictionary *attrs = [query mutableCopy];
-        attrs[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
-        attrs[(__bridge id)kSecValueData] = data;
-
-        OSStatus st = SecItemAdd((__bridge CFDictionaryRef)attrs, NULL);
-        return (st == errSecSuccess) ? 1 : 0;
-#else
-        NSString *path = mac_auth_path();
-        NSString *dir = [path stringByDeletingLastPathComponent];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        if (![data writeToFile:path options:NSDataWritingAtomic error:nil]) return 0;
-        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0600} ofItemAtPath:path error:nil];
-        return 1;
-#endif
+        return write_auth_dict(dict);
     }
 }
 
@@ -296,6 +383,14 @@ static void ensure_initialized_locked(void) {
                 id natVal = dict[@"nat_ip"];
                 if ([natVal isKindOfClass:[NSString class]]) {
                     strncpy(s_nat_ip, [natVal UTF8String], sizeof(s_nat_ip) - 1);
+                }
+
+                id refreshVal = dict[@"refresh_token"];
+                NSTimeInterval tokAt = [dict[@"nex_token_at"] isKindOfClass:[NSNumber class]] ? [dict[@"nex_token_at"] doubleValue] : 0;
+                NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+                BOOL tokenStale = (strncmp(s_token, "nx2", 3) != 0) || (tokAt > 0 && (now - tokAt) > 20 * 3600);
+                if ([refreshVal isKindOfClass:[NSString class]] && [refreshVal length] && tokenStale) {
+                    nextendo_try_refresh_locked(refreshVal, dict);
                 }
 
                 LOG("[Nextendo] Loaded config from %s (pid=%llu, user='%s')", [path UTF8String], s_pid, s_username);
@@ -546,9 +641,11 @@ int nextendo_redirect_host(const char *host, char *out_ip, size_t out_sz, char *
 
     const char *target_ip = NULL;
 
-    // NAT test responders
-    if (wildcard_match("nncs1-*.n.n.srv.nintendo.net", eff_host) ||
-        wildcard_match("nncs2-*.n.n.srv.nintendo.net", eff_host)) {
+    // NAT test responders (nncs1 -> server_ip, nncs2 -> nat_ip; two distinct IPs required for NAT type detection)
+    // and NEX/Pia endpoints hosted alongside the NAT responder
+    if (wildcard_match("nncs2-*.n.n.srv.nintendo.net", eff_host) ||
+        strcasecmp(eff_host, "g2b309e01-lp1.s.n.srv.nintendo.net") == 0 ||
+        strcasecmp(eff_host, "g2df33d01-lp1.p.srv.nintendo.net") == 0) {
         target_ip = s_nat_ip;
     }
     // Nintendo server domain wildcards

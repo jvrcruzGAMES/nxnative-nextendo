@@ -86,3 +86,4 @@ General host changes first needed here; each applies to every game:
 ## Open
 
 - Mii heads draw nothing unless the player supplies their console's MiiModel archive (`0100000000000802`) under `DM_SYSTEM_DIR` ([A console's own Mii database and system data](../../../docs/reference/services.md#a-consoles-own-mii-database-and-system-data)); not run with one, as no console files are on hand.
+- Nextendo Network online login (`nx2...` NEX token via `/api/nex-token`) and Online Play verified on macOS.

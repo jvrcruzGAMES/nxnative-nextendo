@@ -53,10 +53,10 @@ int main(void) {
     const char *last_host = nextendo_last_host_for_ip("164.132.111.120");
     assert(last_host && !strcmp(last_host, "nncs2-lp1.n.n.srv.nintendo.net"));
 
-    // MK8D NEX secure server -> Server IP
+    // MK8D NEX secure server -> NAT IP (matching Ryujinx-Nextendo DnsMitmResolver)
     r = nextendo_redirect_host("g2b309e01-lp1.s.n.srv.nintendo.net", ip, sizeof(ip), canon, sizeof(canon));
     assert(r == 1);
-    assert(!strcmp(ip, "51.178.29.194"));
+    assert(!strcmp(ip, "164.132.111.120"));
 
     // JWT token generation
     char jwt[2048] = {0};

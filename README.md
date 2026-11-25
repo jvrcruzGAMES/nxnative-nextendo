@@ -86,7 +86,7 @@ python3 -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; 
 python3 scripts/build_ipa_from_nsp.py ~/Games/MarioWonder -k ~/keys/prod.keys
 ```
 
-Optionally supply Switch firmware with `--firmware ~/keys/Firmware.zip` to extract authentic system data, 3D Mii models, and shared system fonts into the bundle.
+Optionally supply Switch firmware with `--firmware ~/keys/Firmware.zip` (tested with firmware 22.5.0) to extract authentic system data, 3D Mii models, and shared system fonts into the bundle.
 
 For a Mac app, add `--platform mac-app` and open the resulting `.app` in Finder. By default, the script saves the IPA or Mac app in the game's folder. See [The packing script in detail](docs/development.md#the-packing-script-in-detail) for all options.
 
@@ -150,9 +150,13 @@ This fork adds full, native integration with the [Nextendo Network](https://next
   - BAAS authentication tokens (RS256 JWTs) are dynamically generated locally using Apple's Security framework to authenticate sessions with Nextendo services.
 - **Native Error Applet UI**: When games encounter network or connectivity issues, error codes (e.g. `2XXX-YYYY`) are presented using native modal dialogs (`UIAlertController` on iOS and `NSAlert` on macOS), ensuring players receive clear visual feedback.
 - **Authentic Built-in Miis & Native Mii Editor**: Fully implements the 6 canonical Nintendo Switch guest presets (Guest A through Guest F) for games with Mii support (such as Mario Kart 8 Deluxe). When a game invokes the system Mii applet (`MiiEdit` / `nn::mii`), nxnative launches a native modal editor (`NSAlert` on macOS, `UIAlertController` on iOS) to customize nicknames, gender, colors, and presets synchronously.
-- **Firmware Integration**: Supports packaging official Switch `Firmware.zip` archives directly via `--firmware`. Extracts system data (`MiiModel` 3D meshes and textures) and decodes shared system fonts (`standard.ttf`, `nintendo_ext.ttf`) into the application bundle for 100% authentic rendering.
+- **Firmware Integration**: Supports packaging official Switch `Firmware.zip` archives directly via `--firmware` (tested with firmware 22.5.0). Extracts system data (`MiiModel` 3D meshes and textures, `MiiEdit` applet) and decodes shared system fonts (`standard.ttf`, `nintendo_ext.ttf`) into the application bundle for 100% authentic rendering.
 
 See [Nextendo Network in Development](docs/development.md#nextendo-network) for architectural and implementation details.
+
+### Tested Games
+
+- **[Mario Kart 8 Deluxe](dm/games/0100152000022000/README.md)** (`0100152000022000`): Nextendo login, matchmaking, and online play verified on macOS.
 
 ## Discussions
 

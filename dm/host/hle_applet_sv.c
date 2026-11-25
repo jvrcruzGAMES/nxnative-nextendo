@@ -419,6 +419,31 @@ static Result fatal_u_answer(sf_req *q) {
 }
 SF_SERVICE("fatal:u", fatal_u_answer);
 
+static Result prepo_answer(sf_req *q) {
+    if (q->cmd == 10300) { // GetTransmissionStatus -> u32 status = 0 (idle)
+        uint32_t st = 0;
+        memcpy(q->out, &st, sizeof(st));
+        q->out_len = sizeof(st);
+        return RES_OK;
+    }
+    if (q->cmd == 20100) { // GetSystemSessionId -> u64 session_id = 1
+        uint64_t sid = 1;
+        memcpy(q->out, &sid, sizeof(sid));
+        q->out_len = sizeof(sid);
+        return RES_OK;
+    }
+    return RES_OK;
+}
+static Result prepo_a_answer(sf_req *q) { return prepo_answer(q); }
+static Result prepo_a2_answer(sf_req *q) { return prepo_answer(q); }
+static Result prepo_m_answer(sf_req *q) { return prepo_answer(q); }
+static Result prepo_s_answer(sf_req *q) { return prepo_answer(q); }
+SF_SERVICE("prepo:u", prepo_answer);
+SF_SERVICE("prepo:a", prepo_a_answer);
+SF_SERVICE("prepo:a2", prepo_a2_answer);
+SF_SERVICE("prepo:m", prepo_m_answer);
+SF_SERVICE("prepo:s", prepo_s_answer);
+
 typedef struct {
     int fd;
     size_t size;

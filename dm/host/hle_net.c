@@ -16,6 +16,7 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <Security/SecureTransport.h>
+#include <Security/Security.h>
 
 HLE_FORCE("_ZN2nn6socket10InitializeERKNS0_6ConfigE", "connects to the bsd socket service", Result, h_socket_Initialize, const void *cfg) { (void)cfg; return RES_OK; }
 HLE_FORCE("_ZN2nn6socket8internal10InitializeEi", "connects to the bsd socket service", Result, h_socket_InitializeInternal, int n) { (void)n; return RES_OK; }
@@ -42,7 +43,10 @@ HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEPNS_6socket6InAddrE", "primar
     }
     if (a) *a = 0; return RES_FAIL;
 }
-HLE_FORCE("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", "offline: no proxy setting", Result, h_nifm_GetProxy, void *p) { (void)p; return RES_FAIL; }
+HLE_FORCE("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", "no proxy setting", Result, h_nifm_GetProxy, void *p) {
+    if (nextendo_enabled() && p) { memset(p, 0, 0xaa); return RES_OK; }
+    return RES_FAIL;
+}
 HLE_FORCE("nnsslInitialize", "connects to the ssl service", Result, h_ssl_Initialize, void) { return RES_OK; }
 HLE_FORCE("nnsslFinalize", "pairs with nnsslInitialize", Result, h_ssl_Finalize, void) { return RES_OK; }
 
@@ -193,7 +197,7 @@ int dm_sk_close(int fd) {
     while (p) { sk_packet *next = p->next; free(p); p = next; }
     g_efd[fd].head = g_efd[fd].tail = NULL; g_efd[fd].used = 0; pthread_cond_broadcast(&g_efd_c);
     pthread_mutex_unlock(&g_efd_m);
-    if (real >= 0) close(real);
+    if (real >= 0) { LOG("[Socket] tid=%04lx close(fd=%d, real_fd=%d)", (unsigned long)(uintptr_t)pthread_self() & 0xffff, fd, real); close(real); }
     return 0;
 }
 static int efd_read(int fd, uint64_t *out) {
@@ -459,6 +463,7 @@ int dm_sk_getopt(int fd, int level, int option, void *value, unsigned *size) {
         else if (option == 0x1001) v = g_efd[fd].sndbuf; else if (option == 0x1002) v = g_efd[fd].rcvbuf;
         else r = sk_error(42);
         if (!r) { memcpy(value, &v, sizeof v); *size = sizeof v; }
+        LOG("[Socket] getopt(fd=%d, level=0x%x, opt=0x%x) -> r=%d v=%d", fd, level, option, r, v);
     }
     pthread_mutex_unlock(&g_efd_m); return r;
 }
@@ -506,6 +511,9 @@ long dm_sk_sendto(int fd, const void *data, unsigned long n, int flags, const vo
         sa.sin_family = AF_INET;
         sa.sin_port = htons(port);
         sa.sin_addr.s_addr = htonl(addr);
+        if (real >= 0 && g_efd[fd].used == SK_TCP) {
+            LOG("[Socket] tid=%04lx send(fd=%d, real=%d, n=%lu, flags=0x%x)", (unsigned long)(uintptr_t)pthread_self() & 0xffff, fd, real, n, flags);
+        }
         pthread_mutex_unlock(&g_efd_m);
         ssize_t sent = sendto(real, data, n, 0, (struct sockaddr *)&sa, sizeof(sa));
         if (sent < 0) return sk_error(host_errno_to_switch(errno));
@@ -538,6 +546,7 @@ long dm_sk_recvfrom(int fd, void *data, unsigned long n, int flags, void *a, uns
         pthread_mutex_unlock(&g_efd_m);
         int hflags = (flags & SK_MSG_PEEK ? MSG_PEEK : 0) | (flags & SK_MSG_DONTWAIT ? MSG_DONTWAIT : 0);
         ssize_t recvd = recv(real, data, n, hflags);
+        LOG("[Socket] tid=%04lx recv(fd=%d, real=%d, n=%lu, flags=0x%x) -> %zd (errno=%d)", (unsigned long)(uintptr_t)pthread_self() & 0xffff, fd, real, n, flags, recvd, errno);
         if (recvd < 0) return sk_error(host_errno_to_switch(errno));
         return (long)recvd;
     }
@@ -667,6 +676,11 @@ int dm_sk_poll(void *fds, uint64_t n, int ms) {
             int hr = poll(host_pfd, n_host, 0);
             if (hr > 0) {
                 apply_host_pfd_revents(p, host_pfd, host_pfd_map, host_efd_map, n_host, &ready);
+            }
+            static int poll_cnt = 0;
+            if (hr > 0 || (poll_cnt++ % 50) == 0) {
+                LOG("[Socket] tid=%04lx poll(n_host=%d, ms=%d) -> hr=%d ready=%d fd0=%d ev0=0x%x rev0=0x%x",
+                    (unsigned long)(uintptr_t)pthread_self() & 0xffff, n_host, ms, hr, ready, p[host_pfd_map[0]].fd, p[host_pfd_map[0]].events, p[host_pfd_map[0]].revents);
             }
         }
 
@@ -1054,8 +1068,8 @@ HLE_FORCE("_ZN2nn3ssl10InitializeEv", "nn::ssl::Initialize", Result, h_ssl_InitC
 HLE_FORCE("_ZN2nn3ssl8FinalizeEv", "nn::ssl::Finalize", Result, h_ssl_FinCpp, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", "ssl context create", Result, h_ssl_CtxCreate, void *self, int v) { (void)self; (void)v; return RES_OK; }
 HLE_FORCE("_ZN2nn3ssl7Context7DestroyEv", "ssl context destroy", Result, h_ssl_CtxDestroy, void *self) { (void)self; return RES_OK; }
-SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxRegPki, void *self, uint64_t *id, int p) { (void)self; (void)id; (void)p; return RES_FAIL; }
-SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t id) { (void)self; (void)id; return RES_FAIL; }
+SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxRegPki, void *self, uint64_t *id, int p) { (void)self; (void)p; if (id) *id = 1; return RES_OK; }
+SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t id) { (void)self; (void)id; return RES_OK; }
 SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) { (void)ids; (void)n; if (o) *o = 0; return RES_FAIL; }
 SSF("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS1_22BuiltInCertificateInfoEPhjPNS0_15CaCertificateIdEj", h_ssl_BiCerts, void **o, uint8_t *b, unsigned bs, void *ids, unsigned n) { (void)o; (void)b; (void)bs; (void)ids; (void)n; return RES_FAIL; }
 
@@ -1072,6 +1086,8 @@ typedef struct {
     int io_mode;
     uint32_t last_error;
     char alpn[64];
+    void *cert_buf;
+    uint32_t cert_buf_sz;
 } dm_ssl_conn_t;
 
 static dm_ssl_conn_t g_ssl_conns[SSL_CONN_MAX];
@@ -1123,9 +1139,12 @@ static void ssl_free_conn(dm_ssl_conn_t *conn) {
 }
 
 static OSStatus ssl_read_cb(SSLConnectionRef connection, void *data, size_t *dataLength) {
-    int fd = (int)(intptr_t)connection;
+    dm_ssl_conn_t *c = (dm_ssl_conn_t *)connection;
+    int fd = c ? c->real_fd : -1;
+    if (fd < 0) { *dataLength = 0; return (OSStatus)-36; }
     size_t requested = *dataLength;
-    ssize_t bytes_read = read(fd, data, requested);
+    int flags = (c->io_mode == 2 || (c->guest_fd >= 0 && c->guest_fd < EFD_MAX && (g_efd[c->guest_fd].flags & SK_NONBLOCK))) ? MSG_DONTWAIT : 0;
+    ssize_t bytes_read = recv(fd, data, requested, flags);
     if (bytes_read > 0) {
         *dataLength = (size_t)bytes_read;
         return (size_t)bytes_read < requested ? errSSLWouldBlock : noErr;
@@ -1140,9 +1159,12 @@ static OSStatus ssl_read_cb(SSLConnectionRef connection, void *data, size_t *dat
 }
 
 static OSStatus ssl_write_cb(SSLConnectionRef connection, const void *data, size_t *dataLength) {
-    int fd = (int)(intptr_t)connection;
+    dm_ssl_conn_t *c = (dm_ssl_conn_t *)connection;
+    int fd = c ? c->real_fd : -1;
+    if (fd < 0) { *dataLength = 0; return (OSStatus)-36; }
     size_t requested = *dataLength;
-    ssize_t bytes_written = write(fd, data, requested);
+    int flags = (c->io_mode == 2 || (c->guest_fd >= 0 && c->guest_fd < EFD_MAX && (g_efd[c->guest_fd].flags & SK_NONBLOCK))) ? MSG_DONTWAIT : 0;
+    ssize_t bytes_written = send(fd, data, requested, flags);
     if (bytes_written >= 0) {
         *dataLength = (size_t)bytes_written;
         return (size_t)bytes_written < requested ? errSSLWouldBlock : noErr;
@@ -1221,7 +1243,7 @@ static Result ssl_do_handshake_internal(dm_ssl_conn_t *c) {
         c->ssl_ctx = SSLCreateContext(NULL, kSSLClientSide, kSSLStreamType);
         if (!c->ssl_ctx) return RES_FAIL;
         SSLSetIOFuncs(c->ssl_ctx, ssl_read_cb, ssl_write_cb);
-        SSLSetConnection(c->ssl_ctx, (SSLConnectionRef)(intptr_t)c->real_fd);
+        SSLSetConnection(c->ssl_ctx, (SSLConnectionRef)c);
 
         const char *sni = c->hostname[0] ? c->hostname : NULL;
         if (!sni && c->guest_fd >= 0 && c->guest_fd < EFD_MAX) {
@@ -1255,14 +1277,16 @@ static Result ssl_do_handshake_internal(dm_ssl_conn_t *c) {
     int real_fd = c->real_fd;
 
     // Handshake loop: poll for up to 3000ms if would block
+    uint64_t t0 = guest_ns();
     for (int attempts = 0; attempts < 300; attempts++) {
         OSStatus st = SSLHandshake(ctx);
         if (st == errSSLServerAuthCompleted) {
+            LOG("[SSL] tid=%04lx ServerAuthCompleted at +%llu ms", (unsigned long)(uintptr_t)pthread_self() & 0xffff, (unsigned long long)(guest_ns() - t0) / 1000000);
             st = SSLHandshake(ctx);
         }
         if (st == noErr) {
             c->handshake_done = 1;
-            LOG("[SSL] Handshake SUCCESS for fd=%d", real_fd);
+            LOG("[SSL] tid=%04lx Handshake SUCCESS for fd=%d (attempts=%d, %llu ms)", (unsigned long)(uintptr_t)pthread_self() & 0xffff, real_fd, attempts, (unsigned long long)(guest_ns() - t0) / 1000000);
             return RES_OK;
         }
         if (st == errSSLWouldBlock) {
@@ -1354,25 +1378,34 @@ HLE_FORCE("_ZN2nn3ssl10Connection5WriteEPKcj", "ssl connection write", int, h_ss
     return r;
 }
 
-SSF("_ZN2nn3ssl10Connection4PeekEPcPij", h_ssl_CnPeek, void *self, char *b, int *o, unsigned n) {
-    if (!nextendo_enabled() || !self || !b || !n) { if (o) *o = 0; return RES_FAIL; }
-    dm_host_mutex_lock(&g_ssl_m);
-    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
-    if (!c || !c->ssl_ctx || !c->handshake_done) {
-        pthread_mutex_unlock(&g_ssl_m);
-        if (o) *o = 0;
-        return RES_FAIL;
-    }
+static Result ssl_peek_alive(dm_ssl_conn_t *c) {
+    if (!c || !c->ssl_ctx || !c->handshake_done) return RES_FAIL;
     size_t buf_sz = 0;
     SSLGetBufferedReadSize(c->ssl_ctx, &buf_sz);
-    size_t to_copy = (buf_sz < n) ? buf_sz : n;
-    size_t read_bytes = 0;
-    if (to_copy > 0) {
-        SSLRead(c->ssl_ctx, b, to_copy, &read_bytes);
+    if (buf_sz == 0 && c->real_fd >= 0) {
+        struct pollfd pfd = { c->real_fd, POLLIN, 0 };
+        if (poll(&pfd, 1, 0) > 0) {
+            if (pfd.revents & (POLLERR | POLLNVAL)) return RES_FAIL;
+            if (pfd.revents & POLLIN) {
+                char tmp;
+                ssize_t pr = recv(c->real_fd, &tmp, 1, MSG_PEEK | MSG_DONTWAIT);
+                if (pr == 0) return RES_OK; // EOF
+            } else if (pfd.revents & POLLHUP) {
+                return RES_OK; // EOF
+            }
+        }
     }
-    if (o) *o = (int)read_bytes;
+    return 0x1987b; // nn::ssl::ResultWouldBlock: connection is alive
+}
+
+SSF("_ZN2nn3ssl10Connection4PeekEPcPij", h_ssl_CnPeek, void *self, char *b, int *o, unsigned n) {
+    (void)b; (void)n;
+    if (!nextendo_enabled() || !self) { if (o) *o = 0; return RES_FAIL; }
+    dm_host_mutex_lock(&g_ssl_m);
+    Result r = ssl_peek_alive(ssl_find_conn_by_self(self));
     pthread_mutex_unlock(&g_ssl_m);
-    return RES_OK;
+    if (o) *o = (r == 0x1987b) ? -1 : 0;
+    return r;
 }
 
 SSF("_ZN2nn3ssl10Connection4PollEPNS1_9PollEventES3_j", h_ssl_CnPoll, void *self, void *o, void *i, unsigned t) {
@@ -1381,73 +1414,121 @@ SSF("_ZN2nn3ssl10Connection4PollEPNS1_9PollEventES3_j", h_ssl_CnPoll, void *self
     return RES_OK;
 }
 
-// C ssl interface
-HLE_FORCE("nnsslContextCreate", "ssl context create", Result, h_nssl_CtxCreate, uint32_t *out_id, uint32_t ver) {
-    (void)ver;
-    if (out_id) *out_id = 1;
+// C ssl interface: every nnssl* function takes the guest's nn::ssl::Context* or nn::ssl::Connection* pointer as its first argument.
+HLE_FORCE("nnsslContextCreate", "ssl context create", Result, h_nssl_CtxCreate, void *self, uint32_t ver) {
+    (void)self; (void)ver;
     return RES_OK;
 }
-HLE_FORCE("nnsslConnectionCreate", "ssl connection create", Result, h_nssl_Create, uint32_t *out_id, uint32_t ctx_id) {
-    (void)ctx_id;
+HLE_FORCE("nnsslConnectionCreate", "ssl connection create", Result, h_nssl_Create, void *self, void *ctx) {
+    (void)ctx;
     if (!nextendo_enabled()) return RES_FAIL;
     dm_host_mutex_lock(&g_ssl_m);
-    dm_ssl_conn_t *c = ssl_alloc_conn(NULL, out_id);
+    dm_ssl_conn_t *c = ssl_alloc_conn(self, NULL);
     pthread_mutex_unlock(&g_ssl_m);
-    LOG("[SSL] nnsslConnectionCreate -> id=%u", out_id ? *out_id : 0);
+    LOG("[SSL] nnsslConnectionCreate(self=%p) -> id=%u", self, c ? c->conn_id : 0);
     return c ? RES_OK : RES_FAIL;
 }
-HLE_FORCE("nnsslConnectionDestroy", "ssl connection destroy", Result, h_nssl_Destroy, uint32_t id) {
+HLE_FORCE("nnsslConnectionDestroy", "ssl connection destroy", Result, h_nssl_Destroy, void *self) {
     if (!nextendo_enabled()) return RES_FAIL;
     dm_host_mutex_lock(&g_ssl_m);
-    ssl_free_conn(ssl_find_conn_by_id(id));
+    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
+    uint32_t id = c ? c->conn_id : 0;
+    ssl_free_conn(c);
     pthread_mutex_unlock(&g_ssl_m);
-    LOG("[SSL] nnsslConnectionDestroy(id=%u)", id);
+    LOG("[SSL] tid=%04lx nnsslConnectionDestroy(self=%p, id=%u)", (unsigned long)(uintptr_t)pthread_self() & 0xffff, self, id);
     return RES_OK;
 }
-HLE_FORCE("nnsslConnectionSetSocketDescriptor", "ssl set socket", Result, h_nssl_SetSock, uint32_t id, int s) {
+HLE_FORCE("nnsslConnectionSetSocketDescriptor", "ssl set socket", Result, h_nssl_SetSock, void *self, int s) {
     if (!nextendo_enabled()) return RES_FAIL;
     dm_host_mutex_lock(&g_ssl_m);
-    dm_ssl_conn_t *c = ssl_find_conn_by_id(id);
+    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
     if (c) {
         c->guest_fd = s;
         c->real_fd = (s >= 0 && s < EFD_MAX) ? g_efd[s].real_fd : -1;
     }
+    int rfd = c ? c->real_fd : -1;
     pthread_mutex_unlock(&g_ssl_m);
-    LOG("[SSL] nnsslConnectionSetSocketDescriptor(id=%u, guest_fd=%d, real_fd=%d)", id, s, c ? c->real_fd : -1);
+    LOG("[SSL] nnsslConnectionSetSocketDescriptor(self=%p, guest_fd=%d, real_fd=%d)", self, s, rfd);
     return c ? RES_OK : RES_FAIL;
 }
-HLE_FORCE("nnsslConnectionSetHostName", "ssl set host name", Result, h_nssl_SetHost, uint32_t id, const char *h, uint32_t n) {
+HLE_FORCE("nnsslConnectionSetHostName", "ssl set host name", Result, h_nssl_SetHost, void *self, const char *h, uint32_t n) {
     if (!nextendo_enabled()) return RES_FAIL;
     dm_host_mutex_lock(&g_ssl_m);
-    dm_ssl_conn_t *c = ssl_find_conn_by_id(id);
+    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
     if (c && h) {
         uint32_t len = n < sizeof(c->hostname) - 1 ? n : (uint32_t)(sizeof(c->hostname) - 1);
         memcpy(c->hostname, h, len);
         c->hostname[len] = '\0';
     }
     pthread_mutex_unlock(&g_ssl_m);
-    LOG("[SSL] nnsslConnectionSetHostName(id=%u, host=%.*s)", id, (int)n, h ? h : "");
+    LOG("[SSL] nnsslConnectionSetHostName(self=%p, host=%.*s)", self, (int)n, h ? h : "");
     return c ? RES_OK : RES_FAIL;
 }
-HLE_FORCE("nnsslConnectionDoHandshakeWithCertBuffer", "ssl handshake", Result, h_nssl_Handshake, uint32_t id, void *buf, uint32_t sz) {
-    (void)buf; (void)sz;
+static Result ssl_handshake_and_cert(void *self, uint32_t *out_cert_sz, uint32_t *out_cert_cnt, void *buf, uint32_t sz) {
     if (!nextendo_enabled()) return RES_FAIL;
+    if (out_cert_sz) *out_cert_sz = 0;
+    if (out_cert_cnt) *out_cert_cnt = 0;
     dm_host_mutex_lock(&g_ssl_m);
-    dm_ssl_conn_t *c = ssl_find_conn_by_id(id);
+    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
     Result r = ssl_do_handshake_internal(c);
+    if (r == RES_OK && c && c->ssl_ctx) {
+        void *dst = buf ? buf : c->cert_buf;
+        uint32_t dst_sz = buf ? sz : c->cert_buf_sz;
+        SecTrustRef trust = NULL;
+        OSStatus tst = SSLCopyPeerTrust(c->ssl_ctx, &trust);
+        CFIndex cnt = 0;
+        CFIndex copied_len = 0;
+        if (tst == noErr && trust) {
+            CFArrayRef chain = SecTrustCopyCertificateChain(trust);
+            cnt = chain ? CFArrayGetCount(chain) : 0;
+            if (chain && cnt > 0) {
+                SecCertificateRef cert = (SecCertificateRef)CFArrayGetValueAtIndex(chain, 0);
+                CFDataRef der = SecCertificateCopyData(cert);
+                if (der) {
+                    CFIndex len = CFDataGetLength(der);
+                    if (len > 0) {
+                        if (out_cert_sz) *out_cert_sz = (uint32_t)len;
+                        if (out_cert_cnt) *out_cert_cnt = 1;
+                        if (dst && (uint32_t)len <= dst_sz) {
+                            memcpy(dst, CFDataGetBytePtr(der), (size_t)len);
+                            copied_len = len;
+                        }
+                    }
+                    CFRelease(der);
+                }
+            }
+            if (chain) CFRelease(chain);
+            CFRelease(trust);
+        }
+        LOG("[SSL] Handshake cert: tst=%d trust=%p cnt=%ld dst=%p dst_sz=%u copied=%ld", (int)tst, (void *)trust, (long)cnt, dst, dst_sz, (long)copied_len);
+    }
     pthread_mutex_unlock(&g_ssl_m);
     return r;
 }
-HLE_FORCE("nnsslConnectionDoHandshake", "ssl handshake no cert", Result, h_nssl_HandshakeNoCert, uint32_t id) {
-    return h_nssl_Handshake(id, NULL, 0);
+HLE_FORCE("nnsslConnectionSetServerCertBuffer", "ssl set server cert buffer", Result, h_nssl_SetCertBuf, void *self, void *buf, uint32_t sz) {
+    dm_host_mutex_lock(&g_ssl_m);
+    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
+    if (c) { c->cert_buf = buf; c->cert_buf_sz = sz; }
+    pthread_mutex_unlock(&g_ssl_m);
+    LOG("[SSL] nnsslConnectionSetServerCertBuffer(self=%p, buf=%p, sz=%u)", self, buf, sz);
+    return RES_OK;
 }
-HLE_FORCE("nnsslConnectionDoHandshakeWithBuffer", "ssl handshake buf", Result, h_nssl_HandshakeBuf, uint32_t id, void *buf, uint32_t sz) {
-    return h_nssl_Handshake(id, buf, sz);
+SSF("_ZN2nn3ssl10Connection19SetServerCertBufferEPcj", h_ssl_CnSetCertBuf, void *self, void *buf, unsigned sz) {
+    return h_nssl_SetCertBuf(self, buf, sz);
 }
-HLE_FORCE("nnsslConnectionRead", "ssl read", Result, h_nssl_Read, uint32_t id, void *buf, uint32_t sz, uint32_t *out_read) {
+HLE_FORCE("nnsslConnectionDoHandshakeWithCertBuffer", "ssl handshake", Result, h_nssl_Handshake, void *self, uint32_t *out_cert_sz, uint32_t *out_cert_cnt) {
+    return ssl_handshake_and_cert(self, out_cert_sz, out_cert_cnt, NULL, 0);
+}
+HLE_FORCE("nnsslConnectionDoHandshake", "ssl handshake no cert", Result, h_nssl_HandshakeNoCert, void *self) {
+    return ssl_handshake_and_cert(self, NULL, NULL, NULL, 0);
+}
+HLE_FORCE("nnsslConnectionDoHandshakeWithBuffer", "ssl handshake buf", Result, h_nssl_HandshakeBuf, void *self, uint32_t *out_cert_sz, uint32_t *out_cert_cnt, void *buf, uint32_t sz) {
+    return ssl_handshake_and_cert(self, out_cert_sz, out_cert_cnt, buf, sz);
+}
+HLE_FORCE("nnsslConnectionRead", "ssl read", Result, h_nssl_Read, void *self, void *buf, uint32_t *out_read, uint32_t sz) {
     if (!nextendo_enabled()) return RES_FAIL;
     dm_host_mutex_lock(&g_ssl_m);
-    dm_ssl_conn_t *c = ssl_find_conn_by_id(id);
+    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
     uint32_t res = RES_FAIL;
     int r = ssl_read_internal(c, buf, sz, &res);
     pthread_mutex_unlock(&g_ssl_m);
@@ -1455,12 +1536,13 @@ HLE_FORCE("nnsslConnectionRead", "ssl read", Result, h_nssl_Read, uint32_t id, v
         if (out_read) *out_read = (uint32_t)r;
         return RES_OK;
     }
+    if (out_read) *out_read = 0;
     return res;
 }
-HLE_FORCE("nnsslConnectionWrite", "ssl write", Result, h_nssl_Write, uint32_t id, const void *buf, uint32_t sz, uint32_t *out_written) {
+HLE_FORCE("nnsslConnectionWrite", "ssl write", Result, h_nssl_Write, void *self, const void *buf, uint32_t *out_written, uint32_t sz) {
     if (!nextendo_enabled()) return RES_FAIL;
     dm_host_mutex_lock(&g_ssl_m);
-    dm_ssl_conn_t *c = ssl_find_conn_by_id(id);
+    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
     uint32_t res = RES_FAIL;
     int r = ssl_write_internal(c, buf, sz, &res);
     pthread_mutex_unlock(&g_ssl_m);
@@ -1468,35 +1550,31 @@ HLE_FORCE("nnsslConnectionWrite", "ssl write", Result, h_nssl_Write, uint32_t id
         if (out_written) *out_written = (uint32_t)r;
         return RES_OK;
     }
+    if (out_written) *out_written = 0;
     return res;
 }
-HLE_FORCE("nnsslConnectionGetConnectionId", "ssl get id", Result, h_nssl_GetId, void *self, uint32_t *id) { (void)self; if (id) *id = 1; return RES_OK; }
-HLE_FORCE("nnsslConnectionGetNextAlpnProto", "ssl get alpn", Result, h_nssl_GetAlpn, uint32_t id, void *p, uint32_t *len) { (void)id; (void)p; if (len) *len = 0; return RES_OK; }
-HLE_FORCE("nnsslConnectionGetVerifyCertError", "ssl get verify err", Result, h_nssl_VerifyErr, uint32_t id, uint32_t *err) { (void)id; if (err) *err = 0; return RES_OK; }
-HLE_FORCE("nnsslConnectionPeek", "ssl peek", Result, h_nssl_Peek, uint32_t id, void *b, uint32_t sz, uint32_t *o) {
-    if (!nextendo_enabled() || !b || !sz) { if (o) *o = 0; return RES_FAIL; }
+HLE_FORCE("nnsslConnectionGetConnectionId", "ssl get id", Result, h_nssl_GetId, void *self, uint64_t *id) {
     dm_host_mutex_lock(&g_ssl_m);
-    dm_ssl_conn_t *c = ssl_find_conn_by_id(id);
-    if (!c || !c->ssl_ctx || !c->handshake_done) {
-        pthread_mutex_unlock(&g_ssl_m);
-        if (o) *o = 0;
-        return RES_FAIL;
-    }
-    size_t buf_sz = 0;
-    SSLGetBufferedReadSize(c->ssl_ctx, &buf_sz);
-    size_t to_copy = (buf_sz < sz) ? buf_sz : sz;
-    size_t read_bytes = 0;
-    if (to_copy > 0) {
-        SSLRead(c->ssl_ctx, b, to_copy, &read_bytes);
-    }
+    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
+    if (id) *id = c ? c->conn_id : 0;
     pthread_mutex_unlock(&g_ssl_m);
-    if (o) *o = (uint32_t)read_bytes;
     return RES_OK;
 }
-HLE_FORCE("nnsslConnectionPending", "ssl pending", Result, h_nssl_Pending, uint32_t id, uint32_t *p) {
+HLE_FORCE("nnsslConnectionGetNextAlpnProto", "ssl get alpn", Result, h_nssl_GetAlpn, void *self, void *p, uint32_t *len) { (void)self; (void)p; if (len) *len = 0; return RES_OK; }
+HLE_FORCE("nnsslConnectionGetVerifyCertError", "ssl get verify err", Result, h_nssl_VerifyErr, void *self, uint32_t *err) { (void)self; if (err) *err = 0; return RES_OK; }
+HLE_FORCE("nnsslConnectionPeek", "ssl peek", Result, h_nssl_Peek, void *self, void *b, uint32_t *o, uint32_t sz) {
+    (void)b; (void)sz;
+    if (!nextendo_enabled() || !self) { if (o) *o = 0; return RES_FAIL; }
+    dm_host_mutex_lock(&g_ssl_m);
+    Result r = ssl_peek_alive(ssl_find_conn_by_self(self));
+    pthread_mutex_unlock(&g_ssl_m);
+    if (o) *o = (r == 0x1987b) ? (uint32_t)-1 : 0;
+    return r;
+}
+HLE_FORCE("nnsslConnectionPending", "ssl pending", Result, h_nssl_Pending, void *self, uint32_t *p) {
     if (!nextendo_enabled()) { if (p) *p = 0; return RES_FAIL; }
     dm_host_mutex_lock(&g_ssl_m);
-    dm_ssl_conn_t *c = ssl_find_conn_by_id(id);
+    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
     size_t buf_sz = 0;
     if (c && c->ssl_ctx) {
         SSLGetBufferedReadSize(c->ssl_ctx, &buf_sz);
@@ -1505,19 +1583,25 @@ HLE_FORCE("nnsslConnectionPending", "ssl pending", Result, h_nssl_Pending, uint3
     if (p) *p = (uint32_t)buf_sz;
     return RES_OK;
 }
-HLE_FORCE("nnsslConnectionSetIoMode", "ssl set io mode", Result, h_nssl_SetIo, uint32_t id, uint32_t m) { (void)id; (void)m; return RES_OK; }
-HLE_FORCE("nnsslConnectionSetNextAlpnProto", "ssl set alpn", Result, h_nssl_SetAlpn, uint32_t id, const void *p, uint32_t len) { (void)id; (void)p; (void)len; return RES_OK; }
-HLE_FORCE("nnsslConnectionSetOption", "ssl set opt", Result, h_nssl_SetOpt, uint32_t id, uint32_t opt, uint32_t val) { (void)id; (void)opt; (void)val; return RES_OK; }
-HLE_FORCE("nnsslConnectionSetSessionCacheMode", "ssl set cache", Result, h_nssl_SetCache, uint32_t id, uint32_t m) { (void)id; (void)m; return RES_OK; }
-HLE_FORCE("nnsslConnectionSetVerifyOption", "ssl set verify", Result, h_nssl_SetVerify, uint32_t id, uint32_t v) { (void)id; (void)v; return RES_OK; }
-HLE_FORCE("nnsslContextDestroy", "ssl ctx destroy", Result, h_nssl_CtxDestroy, uint32_t id) { (void)id; return RES_OK; }
-HLE_FORCE("nnsslContextGetContextId", "ssl ctx id", Result, h_nssl_CtxGetId, void *self, uint32_t *id) { (void)self; if (id) *id = 1; return RES_OK; }
+HLE_FORCE("nnsslConnectionSetIoMode", "ssl set io mode", Result, h_nssl_SetIo, void *self, uint32_t m) {
+    dm_host_mutex_lock(&g_ssl_m);
+    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
+    if (c) c->io_mode = (int)m;
+    pthread_mutex_unlock(&g_ssl_m);
+    return RES_OK;
+}
+HLE_FORCE("nnsslConnectionSetNextAlpnProto", "ssl set alpn", Result, h_nssl_SetAlpn, void *self, const void *p, uint32_t len) { (void)self; (void)p; (void)len; return RES_OK; }
+HLE_FORCE("nnsslConnectionSetOption", "ssl set opt", Result, h_nssl_SetOpt, void *self, uint32_t opt, uint32_t val) { (void)self; (void)opt; (void)val; return RES_OK; }
+HLE_FORCE("nnsslConnectionSetSessionCacheMode", "ssl set cache", Result, h_nssl_SetCache, void *self, uint32_t m) { (void)self; (void)m; return RES_OK; }
+HLE_FORCE("nnsslConnectionSetVerifyOption", "ssl set verify", Result, h_nssl_SetVerify, void *self, uint32_t v) { (void)self; (void)v; return RES_OK; }
+HLE_FORCE("nnsslContextDestroy", "ssl ctx destroy", Result, h_nssl_CtxDestroy, void *self) { (void)self; return RES_OK; }
+HLE_FORCE("nnsslContextGetContextId", "ssl ctx id", Result, h_nssl_CtxGetId, void *self, uint64_t *id) { (void)self; if (id) *id = 1; return RES_OK; }
 
 static Result nifm_request_answer(sf_req *q) {
     LOG("sf: nifm IRequest command %u", q->cmd);
     if (q->cmd == 0) { // GetRequestState
         q->out_len = 4;
-        *(uint32_t *)q->out = 1; // 1 = Complete
+        *(uint32_t *)q->out = 3; // 3 = Available (1 = Error, 2 = OnHold)
         return RES_OK;
     }
     if (q->cmd == 1) { // GetResult

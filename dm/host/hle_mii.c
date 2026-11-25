@@ -142,12 +142,12 @@ static int mii_host_path(char *p, size_t n) {
     char t[1024];
     const char *sys = dm_system_dir(t, sizeof t);
     if (strstr(sys, ".app/")) {
-        const char *root = getenv("DM_ROOT");
-        if (root && *root && !strstr(root, ".app/"))
-            return snprintf(p, n, "%s/system/host/MiiDatabase.dat", root) < (int)n;
         const char *home = getenv("HOME");
         if (home && *home)
             return snprintf(p, n, "%s/Library/Application Support/nxnative/system/host/MiiDatabase.dat", home) < (int)n;
+        const char *root = getenv("DM_ROOT");
+        if (root && *root && !strstr(root, ".app/"))
+            return snprintf(p, n, "%s/system/host/MiiDatabase.dat", root) < (int)n;
     }
     return snprintf(p, n, "%s/host/MiiDatabase.dat", sys) < (int)n;
 }

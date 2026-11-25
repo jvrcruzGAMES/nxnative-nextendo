@@ -25,14 +25,18 @@ public enum NextendoKeychain {
 #endif
 
     @discardableResult
-    public static func save(token: String, username: String, pid: UInt64, friendCode: String = "") -> Bool {
+    public static func save(token: String, username: String, pid: UInt64, friendCode: String = "", refreshToken: String = "") -> Bool {
         var dict: [String: Any] = [
             "token": token,
             "username": username,
-            "pid": pid
+            "pid": pid,
+            "nex_token_at": Date().timeIntervalSince1970
         ]
         if !friendCode.isEmpty {
             dict["friend_code"] = friendCode
+        }
+        if !refreshToken.isEmpty {
+            dict["refresh_token"] = refreshToken
         }
         guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return false }
 
@@ -67,6 +71,11 @@ public enum NextendoKeychain {
     }
 
     public static func load() -> (token: String, username: String, pid: UInt64, friendCode: String)? {
+        guard let s = loadSession() else { return nil }
+        return (s.token, s.username, s.pid, s.friendCode)
+    }
+
+    public static func loadSession() -> (token: String, username: String, pid: UInt64, friendCode: String, refreshToken: String, nexTokenAt: TimeInterval)? {
 #if os(macOS)
         guard let data = try? Data(contentsOf: macAuthURL) else { return nil }
 #else
@@ -100,7 +109,9 @@ public enum NextendoKeychain {
             pid = 0xcafe
         }
         let friendCode = (json["friend_code"] as? String) ?? ""
-        return (token, username, pid, friendCode)
+        let refreshToken = (json["refresh_token"] as? String) ?? ""
+        let nexTokenAt = (json["nex_token_at"] as? TimeInterval) ?? 0
+        return (token, username, pid, friendCode, refreshToken, nexTokenAt)
     }
 
     @discardableResult
@@ -263,8 +274,9 @@ public final class NextendoAuth: ObservableObject {
 
     public static let clientId = "nxc_cUHxqMhkXXSA"
     public static let redirectUri = "http://127.0.0.1:47823/callback"
-    public static let authEndpoint = "https://nextendo.network/oauth/authorize"
-    public static let tokenEndpoint = "https://nextendo.network/oauth/token"
+    public static let authEndpoint = "https://nextendo.network/api/oauth/authorize"
+    public static let tokenEndpoint = "https://nextendo.network/api/oauth/token"
+    public static let nexTokenEndpoint = "https://nextendo.network/api/nex-token"
     public static let userEndpoint = "https://nextendo.network/oauth/userinfo"
 
     @Published public private(set) var isLoggedIn = false
@@ -289,7 +301,7 @@ public final class NextendoAuth: ObservableObject {
     }
 
     public func checkLogin() {
-        if let creds = NextendoKeychain.load() {
+        if let creds = NextendoKeychain.loadSession() {
             token = creds.token
             username = creds.username
             pid = creds.pid
@@ -301,7 +313,10 @@ public final class NextendoAuth: ObservableObject {
             if !creds.friendCode.isEmpty {
                 setenv("NEXTENDO_FRIEND_CODE", creds.friendCode, 1)
             }
-            if creds.friendCode.isEmpty || creds.username == "Player" || creds.pid == 0xcafe {
+            let isStale = !creds.token.hasPrefix("nx2") || (Date().timeIntervalSince1970 - creds.nexTokenAt > 20 * 3600)
+            if !creds.refreshToken.isEmpty && isStale {
+                refreshNexToken(refreshToken: creds.refreshToken)
+            } else if creds.friendCode.isEmpty || creds.username == "Player" || creds.pid == 0xcafe {
                 fetchUserProfileAndSave(token: creds.token)
             }
         } else {
@@ -419,6 +434,7 @@ public final class NextendoAuth: ObservableObject {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.setValue(Self.clientId, forHTTPHeaderField: "X-Nextendo-Client-Id")
         req.setValue("nxnative/1.0", forHTTPHeaderField: "User-Agent")
 
         let params: [String: String] = [
@@ -431,7 +447,7 @@ public final class NextendoAuth: ObservableObject {
         let bodyString = params.map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? $0.value)" }.joined(separator: "&")
         req.httpBody = bodyString.data(using: .utf8)
 
-        URLSession.shared.dataTask(with: req) { [weak self] data, response, error in
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
             if let error = error {
                 DispatchQueue.main.async { self?.errorMessage = "Token error: \(error.localizedDescription)" }
                 return
@@ -442,27 +458,93 @@ public final class NextendoAuth: ObservableObject {
                 return
             }
 
-            let accessToken = (json["access_token"] as? String) ?? (json["token"] as? String) ?? (json["nex_token"] as? String)
+            if let nexTok = json["nex_token"] as? String, !nexTok.isEmpty {
+                let acct = json["account"] as? [String: Any]
+                let username = (acct?["username"] as? String) ?? (json["username"] as? String) ?? "Player"
+                let friendCode = (acct?["friend_code"] as? String) ?? (json["friend_code"] as? String) ?? ""
+                let pid = Self.parsePid(acct?["pid"] ?? json["pid"] ?? json["user_id"])
+                let refreshTok = (json["refresh_token"] as? String) ?? ""
+                DispatchQueue.main.async {
+                    self?.saveAndApply(token: nexTok, username: username, pid: pid, friendCode: friendCode, refreshToken: refreshTok)
+                }
+                return
+            }
+
+            let accessToken = (json["access_token"] as? String) ?? (json["token"] as? String)
             guard let tok = accessToken, !tok.isEmpty else {
                 let errDesc = (json["error_description"] as? String) ?? (json["error"] as? String) ?? "Token missing"
                 DispatchQueue.main.async { self?.errorMessage = "Auth error: \(errDesc)" }
                 return
             }
+            let refreshTok = (json["refresh_token"] as? String) ?? ""
+            self?.fetchNexTokenAndSave(accessToken: tok, refreshToken: refreshTok)
+        }.resume()
+    }
 
-            let username = json["username"] as? String
-            let friendCode = json["friend_code"] as? String
-            var pid: UInt64?
-            if let p = json["pid"] as? UInt64 { pid = p }
-            else if let p = json["user_id"] as? UInt64 { pid = p }
-            else if let p = json["pid"] as? Int64 { pid = UInt64(p) }
-            else if let p = json["pid"] as? Int { pid = UInt64(p) }
+    private static func parsePid(_ val: Any?) -> UInt64 {
+        if let p = val as? UInt64 { return p }
+        if let p = val as? Int64 { return UInt64(p) }
+        if let p = val as? Int { return UInt64(p) }
+        if let s = val as? String, let p = UInt64(s) { return p }
+        return 0xcafe
+    }
 
+    private func refreshNexToken(refreshToken: String) {
+        guard let url = URL(string: Self.tokenEndpoint) else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.setValue(Self.clientId, forHTTPHeaderField: "X-Nextendo-Client-Id")
+        req.setValue("nxnative/1.0", forHTTPHeaderField: "User-Agent")
+
+        let params: [(String, String)] = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refreshToken),
+            ("client_id", Self.clientId),
+        ]
+        let bodyStr = params.map {
+            let k = $0.0.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.0
+            let v = $0.1.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.1
+            return "\(k)=\(v)"
+        }.joined(separator: "&")
+        req.httpBody = bodyStr.data(using: .utf8)
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let accessToken = (json["access_token"] as? String) ?? (json["token"] as? String),
+                  !accessToken.isEmpty else {
+                return
+            }
+            let newRefresh = (json["refresh_token"] as? String) ?? refreshToken
+            self?.fetchNexTokenAndSave(accessToken: accessToken, refreshToken: newRefresh)
+        }.resume()
+    }
+
+    private func fetchNexTokenAndSave(accessToken: String, refreshToken: String = "") {
+        guard let url = URL(string: Self.nexTokenEndpoint) else { return }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue(Self.clientId, forHTTPHeaderField: "X-Nextendo-Client-Id")
+        req.setValue("nxnative/1.0", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
+            if let error = error {
+                DispatchQueue.main.async { self?.errorMessage = "NEX token error: \(error.localizedDescription)" }
+                return
+            }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let nexTok = json["nex_token"] as? String, !nexTok.isEmpty else {
+                let msg = (data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["error"] as? String) ?? "Failed to obtain NEX token"
+                DispatchQueue.main.async { self?.errorMessage = msg }
+                return
+            }
+            let user = (json["username"] as? String) ?? "Player"
+            let fc = (json["friend_code"] as? String) ?? ""
+            let pid = Self.parsePid(json["pid"])
             DispatchQueue.main.async {
-                if let username = username, let pid = pid, let friendCode = friendCode, !friendCode.isEmpty {
-                    self?.saveAndApply(token: tok, username: username, pid: pid, friendCode: friendCode)
-                } else {
-                    self?.fetchUserProfileAndSave(token: tok)
-                }
+                self?.saveAndApply(token: nexTok, username: user, pid: pid, friendCode: fc, refreshToken: refreshToken)
             }
         }.resume()
     }
@@ -496,8 +578,8 @@ public final class NextendoAuth: ObservableObject {
         }.resume()
     }
 
-    private func saveAndApply(token: String, username: String, pid: UInt64, friendCode: String = "") {
-        NextendoKeychain.save(token: token, username: username, pid: pid, friendCode: friendCode)
+    private func saveAndApply(token: String, username: String, pid: UInt64, friendCode: String = "", refreshToken: String = "") {
+        NextendoKeychain.save(token: token, username: username, pid: pid, friendCode: friendCode, refreshToken: refreshToken)
         self.token = token
         self.username = username
         self.pid = pid
