@@ -747,3 +747,4 @@ typedef void (*NVNT_nvnCommandBufferSignalEvent)(NVNcommandBuffer*, const NVNeve
 //   nvnWindowBuilderGetAcquireTimeout
 //   nvnWindowSetAcquireTimeout
 //   nvnWindowGetAcquireTimeout
+//   nvnSyncInitializeFromNvRmSyncNVX

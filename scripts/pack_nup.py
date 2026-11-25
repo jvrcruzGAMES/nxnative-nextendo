@@ -218,7 +218,8 @@ def scan(n):
     if not ids: raise Error(f'{n.path}: no exefs/main.npdm in the base or updates')
     if len(ids) != 1: raise Error(f'{n.path}: base and updates have different program IDs: ' + ', '.join(f'{pid:016X}' for pid in sorted(ids)))
     app = ids.pop()
-    if app & 0xFFF: raise Error(f'{n.path}: base program ID {app:016X} is not a base title ID')
+    is_system = (app >> 12) in (0x0100000000000, 0x0100000000001)
+    if app & 0xFFF and not is_system: raise Error(f'{n.path}: base program ID {app:016X} is not a base title ID')
     vers, dlc = {}, {}
     for k in n.packages:
         if k.kind == UPDATE:

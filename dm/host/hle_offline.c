@@ -5,6 +5,7 @@
 #include "hle_net.h"
 #include "hle_nextendo.h"
 #include "front.h"
+#include <arpa/inet.h>
 
 static _Alignas(16) uint8_t g_ev_ldn[0x100];
 
@@ -85,6 +86,7 @@ HLE_FORCE("_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", "local UDP (offline BSD se
 HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PK8addrinfoPPS3_", "name resolution: Nextendo or EAI_FAIL", int, h_sk_Gai2, const char *h, const char *s, const void *hint, void **res) { return dm_sk_getaddrinfo(h, s, hint, res); }
 HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEP8addrinfo", "pairs with GetAddrInfo", void, h_sk_FreeAi2, void *ai) { dm_sk_freeaddrinfo(ai); }
 HLE_FORCE("_ZN2nn6socket11GAIStrErrorENS0_7AiErrnoE", "resolver error text", const char *, h_sk_GaiStr, int e) { (void)e; return "network unavailable"; }
+HLE_FORCE("_ZN2nn6socket11GAIStrErrorEi", "resolver error text", const char *, h_sk_GaiStr2, int e) { (void)e; return "network unavailable"; }
 // SDK 11's overloads with plain sockaddr / int arguments (Big Brain Academy: Brain vs. Brain, through Pia)
 HLE_FORCE("_ZN2nn6socket7ConnectEiPK8sockaddrj", "local UDP (offline BSD service)", int, h_sk_Connect2, int s, const void *a, unsigned n) { return dm_sk_connect(s, a, n); }
 HLE_FORCE("_ZN2nn6socket6AcceptEiP8sockaddrPj", "accept connection", int, h_sk_Accept2, int s, void *a, unsigned *n) { return dm_sk_accept(s, a, n); }
@@ -122,9 +124,21 @@ HLE_FORCE("_ZN2nn8irsensor30GetImageTransferProcessorStateEPNS0_27ImageTransferP
           void *s, void *b, size_t n, const void *h) { (void)s; (void)b; (void)n; (void)h; return RES_FAIL; }
 
 // ---------- ssl: offline, creating a context fails ----------
-HLE_FORCE("_ZN2nn3ssl7Context15ImportClientPkiEPmPKcS4_jj", "SSL (cut)", Result, h_ssl_ImpCli, void *self, uint64_t *id, const char *a, const char *b, unsigned x, unsigned y) { (void)self; (void)a; (void)b; (void)x; (void)y; if (id) *id = 0; return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ssl7Context15ImportServerPkiEPmPKcjNS0_17CertificateFormatE", "SSL (cut)", Result, h_ssl_ImpSrv, void *self, uint64_t *id, const char *a, unsigned n, int f) { (void)self; (void)a; (void)n; (void)f; if (id) *id = 0; return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ssl7Context9ImportCrlEPmPKcj", "SSL (cut)", Result, h_ssl_ImpCrl, void *self, uint64_t *id, const char *a, unsigned n) { (void)self; (void)a; (void)n; if (id) *id = 0; return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ssl7Context15ImportClientPkiEPmPKcS4_jj", "SSL client pki", Result, h_ssl_ImpCli, void *self, uint64_t *id, const char *a, const char *b, unsigned x, unsigned y) {
+    (void)self; (void)a; (void)b; (void)x; (void)y;
+    if (nextendo_enabled()) { if (id) *id = 1; return RES_OK; }
+    if (id) *id = 0; return RES_FAIL;
+}
+HLE_FORCE("_ZN2nn3ssl7Context15ImportServerPkiEPmPKcjNS0_17CertificateFormatE", "SSL server pki", Result, h_ssl_ImpSrv, void *self, uint64_t *id, const char *a, unsigned n, int f) {
+    (void)self; (void)a; (void)n; (void)f;
+    if (nextendo_enabled()) { if (id) *id = 1; return RES_OK; }
+    if (id) *id = 0; return RES_FAIL;
+}
+HLE_FORCE("_ZN2nn3ssl7Context9ImportCrlEPmPKcj", "SSL crl", Result, h_ssl_ImpCrl, void *self, uint64_t *id, const char *a, unsigned n) {
+    (void)self; (void)a; (void)n;
+    if (nextendo_enabled()) { if (id) *id = 1; return RES_OK; }
+    if (id) *id = 0; return RES_FAIL;
+}
 HLE_FORCE("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS0_26BuiltInCertificateInfoBaseEPhjPNS0_15CaCertificateIdEj", "SSL (cut)", Result, h_ssl_Certs,
           void **out, uint8_t *buf, unsigned bn, void *ids, unsigned n) { (void)buf; (void)bn; (void)ids; (void)n; if (out) *out = NULL; return RES_FAIL; }
 
@@ -136,8 +150,9 @@ HLE_FORCE("_ZN2nn4nifm22GetCurrentIpConfigInfoEP7in_addrS2_S2_S2_S2_", "IP confi
         if (a) *a = htonl(0xc0a80164); // 192.168.1.100
         if (b) *b = htonl(0xffffff00); // 255.255.255.0
         if (c) *c = htonl(0xc0a80101); // 192.168.1.1
-        if (d) *d = htonl(0x01010101); // 1.1.1.1
+        if (d) *d = inet_addr(nextendo_get_server_ip());
         if (e) *e = htonl(0x08080808); // 8.8.8.8
+        LOG("[NIFM] GetCurrentIpConfigInfo -> ip=192.168.1.100 dns1=%s", nextendo_get_server_ip());
         return RES_OK;
     }
     uint32_t *p[5] = {a, b, c, d, e}; for (int i = 0; i < 5; i++) if (p[i]) *p[i] = 0; return RES_FAIL;
@@ -148,7 +163,7 @@ HLE_FORCE("_ZN2nn4nifm22GetCurrentIpConfigInfoEPNS_6socket6InAddrES3_S3_S3_S3_",
         if (a) *a = htonl(0xc0a80164);
         if (b) *b = htonl(0xffffff00);
         if (c) *c = htonl(0xc0a80101);
-        if (d) *d = htonl(0x01010101);
+        if (d) *d = inet_addr(nextendo_get_server_ip());
         if (e) *e = htonl(0x08080808);
         return RES_OK;
     }
@@ -205,16 +220,31 @@ HLE_FORCE("_ZN2nn3err9ShowErrorERKNS0_18ErrorResultVariantE", "error display app
     char code_str[32] = {0};
     if (words) {
         LOG("game asks to show an error (ErrorResultVariant: %08x %08x %08x %08x)", words[0], words[1], words[2], words[3]);
-        uint32_t r = words[0];
-        if (r == 0 && words[1] != 0) r = words[1];
-        unsigned mod = r & 0x1ff;
-        unsigned desc = (r >> 9) & 0x1fff;
-        if (mod > 0 && mod < 500) {
+        uint32_t state = words[0];
+        if (state == 1) { // holds Result (32-bit)
+            uint32_t r = words[1];
+            unsigned mod = r & 0x1ff;
+            unsigned desc = (r >> 9) & 0x1fff;
             snprintf(code_str, sizeof(code_str), "%04u-%04u", 2000 + mod, desc);
-        } else if (words[1] != 0) {
-            snprintf(code_str, sizeof(code_str), "%04u-%04u", words[0], words[1]);
+        } else if (state == 2) { // holds ErrorCode (64-bit)
+            uint64_t code = 0;
+            memcpy(&code, words + 1, sizeof(code));
+            unsigned c0 = (unsigned)(code & 0xffffffff);
+            unsigned c1 = (unsigned)(code >> 32);
+            if (c1 != 0) snprintf(code_str, sizeof(code_str), "%04u-%04u", c0, c1);
+            else snprintf(code_str, sizeof(code_str), "%04u", c0);
         } else {
-            snprintf(code_str, sizeof(code_str), "%04u", words[0]);
+            uint32_t r = words[0];
+            if (r == 0 && words[1] != 0) r = words[1];
+            unsigned mod = r & 0x1ff;
+            unsigned desc = (r >> 9) & 0x1fff;
+            if (mod > 0 && mod < 500) {
+                snprintf(code_str, sizeof(code_str), "%04u-%04u", 2000 + mod, desc);
+            } else if (words[1] != 0) {
+                snprintf(code_str, sizeof(code_str), "%04u-%04u", words[0], words[1]);
+            } else {
+                snprintf(code_str, sizeof(code_str), "%04u", words[0]);
+            }
         }
     } else {
         LOG("game asks to show an error (ErrorResultVariant: NULL)");

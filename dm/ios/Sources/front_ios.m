@@ -508,9 +508,16 @@ void front_error_dialog(const char *code, const char *msg) {
     dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
 }
 
-// Native Mii editor (front.h): UIAlertController with nickname and style presets
+// Native Mii editor (front.h): full-screen SwiftUI Mii Creator with 3D rendering and 2D firmware assets
 int front_mii_editor(void *charinfo_out, int is_new) {
     if (!g_layer) return -1;
+    extern int dm_show_mii_editor(void *charinfo_out, int is_new);
+    return dm_show_mii_editor(charinfo_out, is_new);
+}
+
+#if 0
+// Legacy alert stub
+static int legacy_mii_editor(void *charinfo_out, int is_new) {
     mii_charinfo *c = (mii_charinfo *)charinfo_out;
     __block int result = 0;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
@@ -594,6 +601,7 @@ int front_mii_editor(void *charinfo_out, int is_new) {
     dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
     return result;
 }
+#endif
 
 // Save write failed (most likely the phone's storage is full): show a notice on the main thread without blocking the game. hle_fs.c calls this when a save transaction is refused or a mount has to fall back to read-only;
 // the iOS front end used not to implement it, so there was only a log line and the player never learned that progress was not being saved

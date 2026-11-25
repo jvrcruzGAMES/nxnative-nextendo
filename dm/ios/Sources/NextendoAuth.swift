@@ -16,15 +16,37 @@ public enum NextendoKeychain {
     public static let service = "network.nextendo.auth"
     public static let account = "session"
 
+#if os(macOS)
+    private static var macAuthURL: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+        return base.appendingPathComponent("nxnative/nextendo_auth.json")
+    }
+#endif
+
     @discardableResult
-    public static func save(token: String, username: String, pid: UInt64) -> Bool {
-        let dict: [String: Any] = [
+    public static func save(token: String, username: String, pid: UInt64, friendCode: String = "") -> Bool {
+        var dict: [String: Any] = [
             "token": token,
             "username": username,
             "pid": pid
         ]
+        if !friendCode.isEmpty {
+            dict["friend_code"] = friendCode
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return false }
 
+#if os(macOS)
+        let url = macAuthURL
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            return true
+        } catch {
+            return false
+        }
+#else
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -41,9 +63,13 @@ public enum NextendoKeychain {
         ]
         let status = SecItemAdd(attributes as CFDictionary, nil)
         return status == errSecSuccess
+#endif
     }
 
-    public static func load() -> (token: String, username: String, pid: UInt64)? {
+    public static func load() -> (token: String, username: String, pid: UInt64, friendCode: String)? {
+#if os(macOS)
+        guard let data = try? Data(contentsOf: macAuthURL) else { return nil }
+#else
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -54,6 +80,7 @@ public enum NextendoKeychain {
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         guard status == errSecSuccess, let data = result as? Data else { return nil }
+#endif
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let token = json["token"] as? String, !token.isEmpty else {
@@ -72,11 +99,17 @@ public enum NextendoKeychain {
         } else {
             pid = 0xcafe
         }
-        return (token, username, pid)
+        let friendCode = (json["friend_code"] as? String) ?? ""
+        return (token, username, pid, friendCode)
     }
 
     @discardableResult
     public static func delete() -> Bool {
+#if os(macOS)
+        let url = macAuthURL
+        if !FileManager.default.fileExists(atPath: url.path) { return true }
+        return (try? FileManager.default.removeItem(at: url)) != nil
+#else
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -84,6 +117,7 @@ public enum NextendoKeychain {
         ]
         let st = SecItemDelete(query as CFDictionary)
         return st == errSecSuccess || st == errSecItemNotFound
+#endif
     }
 }
 
@@ -231,11 +265,12 @@ public final class NextendoAuth: ObservableObject {
     public static let redirectUri = "http://127.0.0.1:47823/callback"
     public static let authEndpoint = "https://nextendo.network/oauth/authorize"
     public static let tokenEndpoint = "https://nextendo.network/oauth/token"
-    public static let userEndpoint = "https://nextendo.network/api/user/me"
+    public static let userEndpoint = "https://nextendo.network/oauth/userinfo"
 
     @Published public private(set) var isLoggedIn = false
     @Published public private(set) var username = "Player"
     @Published public private(set) var pid: UInt64 = 0
+    @Published public private(set) var friendCode = ""
     @Published public private(set) var token = ""
     @Published public private(set) var isLoggingIn = false
     @Published public var errorMessage: String?
@@ -258,21 +293,30 @@ public final class NextendoAuth: ObservableObject {
             token = creds.token
             username = creds.username
             pid = creds.pid
+            friendCode = creds.friendCode
             isLoggedIn = true
             setenv("NEXTENDO_TOKEN", creds.token, 1)
             setenv("NEXTENDO_USER", creds.username, 1)
             setenv("NEXTENDO_PID", String(creds.pid), 1)
+            if !creds.friendCode.isEmpty {
+                setenv("NEXTENDO_FRIEND_CODE", creds.friendCode, 1)
+            }
+            if creds.friendCode.isEmpty || creds.username == "Player" || creds.pid == 0xcafe {
+                fetchUserProfileAndSave(token: creds.token)
+            }
         } else {
             // Check if environment has it
             if let envTok = getenv("NEXTENDO_TOKEN"), envTok.pointee != 0 {
                 token = String(cString: envTok)
                 username = getenv("NEXTENDO_USER").map { String(cString: $0) } ?? "Player"
                 pid = getenv("NEXTENDO_PID").flatMap { UInt64(String(cString: $0)) } ?? 0xcafe
+                friendCode = getenv("NEXTENDO_FRIEND_CODE").map { String(cString: $0) } ?? ""
                 isLoggedIn = true
             } else {
                 token = ""
                 username = "Player"
                 pid = 0
+                friendCode = ""
                 isLoggedIn = false
             }
         }
@@ -304,7 +348,7 @@ public final class NextendoAuth: ObservableObject {
             URLQueryItem(name: "client_id", value: Self.clientId),
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "redirect_uri", value: Self.redirectUri),
-            URLQueryItem(name: "scope", value: "identity presence profil game.matchmaking"),
+            URLQueryItem(name: "scope", value: "identity presence profil friends game.matchmaking"),
             URLQueryItem(name: "code_challenge", value: challenge),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
             URLQueryItem(name: "state", value: state)
@@ -330,6 +374,12 @@ public final class NextendoAuth: ObservableObject {
         unsetenv("NEXTENDO_TOKEN")
         unsetenv("NEXTENDO_USER")
         unsetenv("NEXTENDO_PID")
+        unsetenv("NEXTENDO_FRIEND_CODE")
+        token = ""
+        username = "Player"
+        pid = 0
+        friendCode = ""
+        isLoggedIn = false
         token = ""
         username = "Player"
         pid = 0
@@ -400,6 +450,7 @@ public final class NextendoAuth: ObservableObject {
             }
 
             let username = json["username"] as? String
+            let friendCode = json["friend_code"] as? String
             var pid: UInt64?
             if let p = json["pid"] as? UInt64 { pid = p }
             else if let p = json["user_id"] as? UInt64 { pid = p }
@@ -407,8 +458,8 @@ public final class NextendoAuth: ObservableObject {
             else if let p = json["pid"] as? Int { pid = UInt64(p) }
 
             DispatchQueue.main.async {
-                if let username = username, let pid = pid {
-                    self?.saveAndApply(token: tok, username: username, pid: pid)
+                if let username = username, let pid = pid, let friendCode = friendCode, !friendCode.isEmpty {
+                    self?.saveAndApply(token: tok, username: username, pid: pid, friendCode: friendCode)
                 } else {
                     self?.fetchUserProfileAndSave(token: tok)
                 }
@@ -428,31 +479,38 @@ public final class NextendoAuth: ObservableObject {
         URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
             var user = "Player"
             var pid: UInt64 = 0xcafe
+            var fc = ""
             if let data = data,
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                if let u = json["username"] as? String { user = u }
+                if let u = json["username"] as? String, !u.isEmpty { user = u }
+                else if let d = json["display_name"] as? String, !d.isEmpty { user = d }
+                if let f = json["friend_code"] as? String { fc = f }
                 if let p = json["pid"] as? UInt64 { pid = p }
                 else if let p = json["id"] as? UInt64 { pid = p }
                 else if let p = json["pid"] as? Int64 { pid = UInt64(p) }
                 else if let p = json["pid"] as? Int { pid = UInt64(p) }
             }
             DispatchQueue.main.async {
-                self?.saveAndApply(token: token, username: user, pid: pid)
+                self?.saveAndApply(token: token, username: user, pid: pid, friendCode: fc)
             }
         }.resume()
     }
 
-    private func saveAndApply(token: String, username: String, pid: UInt64) {
-        NextendoKeychain.save(token: token, username: username, pid: pid)
+    private func saveAndApply(token: String, username: String, pid: UInt64, friendCode: String = "") {
+        NextendoKeychain.save(token: token, username: username, pid: pid, friendCode: friendCode)
         self.token = token
         self.username = username
         self.pid = pid
+        self.friendCode = friendCode
         self.isLoggedIn = true
         self.errorMessage = nil
 
         setenv("NEXTENDO_TOKEN", token, 1)
         setenv("NEXTENDO_USER", username, 1)
         setenv("NEXTENDO_PID", String(pid), 1)
+        if !friendCode.isEmpty {
+            setenv("NEXTENDO_FRIEND_CODE", friendCode, 1)
+        }
     }
 
     private func generatePKCE() -> (verifier: String, challenge: String) {
@@ -490,6 +548,7 @@ private typealias CC_LONG = UInt32
 
 public struct NextendoSection: View {
     @ObservedObject var auth = NextendoAuth.shared
+    @State private var copiedFriendCode = false
 
     public init() {}
 
@@ -499,7 +558,10 @@ public struct NextendoSection: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Connected to Nextendo").font(.body.weight(.medium))
-                        Text("\(auth.username) (PID: \(auth.pidString))")
+                        Text(auth.username)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Text(auth.friendCode.isEmpty ? "Friend Code: —" : "Friend Code: \(auth.friendCode)")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
@@ -507,8 +569,26 @@ public struct NextendoSection: View {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                 }
-                Button("Log Out", role: .destructive) {
-                    auth.logout()
+                HStack(spacing: 12) {
+                    Button("Log Out", role: .destructive) {
+                        auth.logout()
+                    }
+                    Spacer()
+                    if !auth.friendCode.isEmpty {
+                        Button(copiedFriendCode ? "Copied!" : "Copy Friend Code") {
+                            #if canImport(AppKit)
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(auth.friendCode, forType: .string)
+                            #elseif canImport(UIKit)
+                            UIPasteboard.general.string = auth.friendCode
+                            #endif
+                            copiedFriendCode = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                copiedFriendCode = false
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 }
             } else if auth.isLoggingIn {
                 VStack(alignment: .leading, spacing: 8) {

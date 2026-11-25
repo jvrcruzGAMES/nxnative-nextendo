@@ -83,6 +83,8 @@ HOST_BINDING = [
      'why': "the game's own display object; the Asian release's function is the global one's 0x13c0 further on, so the rewriter's function match could give the host both releases' "
             "addresses. No PlatinumGames sibling shares the code: none of its sites has an exact match in ASTRAL CHAIN or Bayonetta 1-3 (nso_fnmap, 2026-11-09)",
      'kept': "1.0.3 (v131072) is the newest update of both releases and likely their last: a function match would serve no other build; the rewriter would also need matched rules that write fixups and declare capabilities, a new mechanism (2026-11-09)"}),
+    ('', '', '880cb7307525d961f4ea9f4e0b3b7f6c', {'what': "MiiEdit static NVN bootstrap loader at 0x5aa5e0", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+     'why': "MiiEdit statically linked NVN driver functions and resolved nvnBootstrapLoader through its own table"}),
 ]
 # Translator rules keyed by one shader's code hash: (the start of the rule's comment, entry)
 SHADER_BINDING = [

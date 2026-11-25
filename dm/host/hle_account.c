@@ -102,7 +102,12 @@ HLE_FORCE("_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAc
           void *info, const UserHandle *h, void *buf, uint64_t sz) {
     (void)h; (void)buf; (void)sz;
     if (nextendo_enabled()) {
-        if (info) memset(info, 0, 0x20);
+        if (info) {
+            memset(info, 0, 0x100);
+            strncpy((char *)info + 0x00, "2000-01-01", 16);
+            strncpy((char *)info + 0x10, "male", 8);
+            strncpy((char *)info + 0x20, "US", 4);
+        }
         return RES_OK;
     }
     return RES_FAIL;
@@ -224,3 +229,82 @@ HLE_FORCE("_ZN2nn7account12AsyncContext6CancelEv", "async context cancel; no req
 HLE_FORCE("_ZN2nn7account12AsyncContext7HasDoneEPb", "async context: always done", Result, h_acc_AcHasDone, void *self, uint8_t *done) { (void)self; *done = 1; return RES_OK; }
 HLE_FORCE("_ZN2nn7account12AsyncContextD1Ev", "async context destructor; no session to close", void, h_acc_AcDtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn7account12AsyncContextaSEOS1_", "async context move assignment; the object holds no host state", void *, h_acc_AcMove, void *self, void *other) { (void)other; return self; }
+
+static Result profile_answer(sf_req *q) {
+    LOG("sf: IProfile command %u (%zu data words in, nb=%u)", q->cmd, q->in_len / 4, q->nb);
+    if (q->cmd == 0 || q->cmd == 1) { // Get / GetBase
+        struct {
+            Uid uid;
+            uint64_t timestamp;
+            char nickname[32];
+        } base;
+        memset(&base, 0, sizeof base);
+        base.uid = k_uid;
+        base.timestamp = 0;
+        const char *e = getenv("DM_NICK");
+        strncpy(base.nickname, e && *e ? e : "Player", sizeof base.nickname - 1);
+        if (q->nb > 0 && q->b[0].p && q->b[0].size >= sizeof base) {
+            memcpy(q->b[0].p, &base, sizeof base);
+        } else {
+            q->out_len = sizeof base;
+            memcpy(q->out, &base, sizeof base);
+        }
+        return RES_OK;
+    }
+    if (q->cmd == 10) { // GetImageSize
+        q->out_len = 4;
+        *(uint32_t *)q->out = (uint32_t)(sizeof k_profile_jpeg - 1);
+        return RES_OK;
+    }
+    if (q->cmd == 11) { // LoadImage
+        uint32_t len = (uint32_t)(sizeof k_profile_jpeg - 1);
+        if (q->nb > 0 && q->b[0].p && q->b[0].size > 0) {
+            size_t sz = q->b[0].size < len ? q->b[0].size : len;
+            memcpy(q->b[0].p, k_profile_jpeg, sz);
+        }
+        q->out_len = 4;
+        *(uint32_t *)q->out = len;
+        return RES_OK;
+    }
+    return RES_OK;
+}
+
+static Result account_root_answer(sf_req *q) {
+    LOG("sf: acc command %u (%zu data words in, nb=%u)", q->cmd, q->in_len / 4, q->nb);
+    if (q->cmd == 0) { // GetUserCount
+        q->out_len = 4;
+        *(int32_t *)q->out = 1;
+        return RES_OK;
+    }
+    if (q->cmd == 1) { // GetUserExistence
+        q->out_len = 1;
+        *(uint8_t *)q->out = 1;
+        return RES_OK;
+    }
+    if (q->cmd == 2 || q->cmd == 3 || q->cmd == 101) { // ListAllUsers, ListOpenUsers, ListQualifiedUsers
+        if (q->nb > 0 && q->b[0].p && q->b[0].size >= sizeof(Uid)) {
+            memcpy(q->b[0].p, &k_uid, sizeof(Uid));
+        }
+        q->out_len = 4;
+        *(int32_t *)q->out = 1;
+        return RES_OK;
+    }
+    if (q->cmd == 4) { // GetLastOpenedUser
+        q->out_len = sizeof(Uid);
+        memcpy(q->out, &k_uid, sizeof(Uid));
+        return RES_OK;
+    }
+    if (q->cmd == 5) { // GetProfile
+        q->out_move = sf_session("IProfile", profile_answer, NULL, NULL);
+        return RES_OK;
+    }
+    if (q->cmd == 50 || q->cmd == 100) { // InitializeApplicationInfo / Restricted
+        return RES_OK;
+    }
+    return RES_OK;
+}
+static Result acc_u0_answer(sf_req *q) { return account_root_answer(q); }
+static Result acc_u1_answer(sf_req *q) { return account_root_answer(q); }
+SF_SERVICE("acc:u0", acc_u0_answer);
+SF_SERVICE("acc:u1", acc_u1_answer);
+

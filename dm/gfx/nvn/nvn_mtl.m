@@ -16656,6 +16656,10 @@ static void present_gpu_note(double s, int fx) {
     n[fx] = 0;
 }
 static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
+__attribute__((weak)) int front_applet_present_mode(void) { return 0; }
+__attribute__((weak)) void *front_applet_surface_texture(int idx, void *mtl_device) { (void)idx; (void)mtl_device; return NULL; }
+__attribute__((weak)) void front_applet_did_present(int idx) { (void)idx; }
+
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
@@ -16713,6 +16717,41 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     pthread_mutex_unlock(&g_shotq_mu);
 
     if (atomic_load(&g_gpu_lost)) return 0;   // the display command buffer would be ignored too: take no drawable from the screen the front end is about to close
+    if (front_applet_present_mode()) {
+        static int s_app_idx = 0;
+        int idx = s_app_idx; s_app_idx ^= 1;
+        id<MTLTexture> dst = (__bridge id<MTLTexture>)front_applet_surface_texture(idx, (__bridge void *)g_dev);
+        if (!dst) return 0;
+        present_pipeline(dst.pixelFormat);
+        int alloc_i = (int)(ticket % 3);
+        if (g_present_alloc_fence[alloc_i]) {
+            pthread_mutex_lock(&g_pq_mu);
+            while (g_present_alloc_done[alloc_i] < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
+            pthread_mutex_unlock(&g_pq_mu);
+        }
+        [g_present_alloc4[alloc_i] reset];
+        id<MTL4CommandBuffer> cb = g_present_cb[alloc_i];
+        [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
+        int kind = present_encode_m4(cb, src, dst, crop, g_present_uv[alloc_i], &g_fx_present);
+        if (!kind) { [cb endCommandBuffer]; return 0; }
+        int fx_kind = kind == PRESENT_METALFX;
+        [cb endCommandBuffer];
+        MTL4CommitOptions *o = [MTL4CommitOptions new];
+        [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+            if (f.error) { MLOG("[RED] display command buffer error: %s", f.error.description.UTF8String); gpu_lost_check(f.error, "display"); }
+            front_applet_did_present(idx);
+            pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; if (ticket > g_present_alloc_done[alloc_i]) g_present_alloc_done[alloc_i] = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv);
+            NSArray *retire = nil; if (!g_pq_inflight && g_ext_retire.count) { retire = g_ext_retire; g_ext_retire = nil; }
+            present_gpu_note(f.GPUEndTime - f.GPUStartTime, fx_kind); pthread_mutex_unlock(&g_pq_mu);
+            if (retire) ext_retire(retire);
+        }];
+        id<MTL4CommandBuffer> buffers[] = {cb};
+        pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
+        [g_q4 commit:buffers count:1 options:o];
+        g_present_alloc_fence[alloc_i] = ticket;
+        (void)frame; (void)period; (void)target_ts; (void)supplied;
+        return 1;
+    }
     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
     if (!layer) return 0;
     if (g_present_layer_resident != layer) { [g_q4 addResidencySet:layer.residencySet]; g_present_layer_resident = layer; }

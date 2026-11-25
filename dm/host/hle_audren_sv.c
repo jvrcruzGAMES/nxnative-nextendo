@@ -415,7 +415,7 @@ static Result sf_audren(sf_req *q) {
         LOG("audren:u: work buffer %#zx for %d Hz, %d voices, revision %.4s", n, (int)rd32(q->in), (int)rd32(q->in + 0x10), (const char *)q->in + 0x30);
         return RES_OK;
     }
-    if (q->cmd == 2) { q->out_move = sf_session("audren:d", NULL, NULL, NULL); LOG("audren:u: audio device service (zeroed answers)"); return RES_OK; }
+    if (q->cmd == 2 || q->cmd == 4) { q->out_move = sf_session("audren:d", NULL, NULL, NULL); LOG("audren:u: audio device service (zeroed answers)"); return RES_OK; }
     if (q->cmd != 0) { LOG("[RED] audren:u: manager command %u answered with success and no output", q->cmd); return RES_OK; }
     if (q->in_len < 0x48) return RES_FAIL;
     int rate = (int)rd32(q->in), samples = (int)rd32(q->in + 4);

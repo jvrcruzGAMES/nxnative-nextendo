@@ -11,8 +11,13 @@
 // DM_PAD_MERGE=1 merges every controller into player 1 instead, DM_KBD_PLAYER=own makes the keyboard player 1 on its own, with the controllers from player 2 on.
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATransaction.h>
+#import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 #import <GameController/GameController.h>
+#include <fcntl.h>
+#include <stdatomic.h>
+#include <sys/mman.h>
 #include "dm.h"
 #include "dm_input.h"
 #include "front.h"
@@ -38,6 +43,7 @@ static void merge_rumble_to(void (*sink)(const dm_haptic_state *));
 #include <sys/stat.h>
 
 static CAMetalLayer *g_layer;
+static dm_applet_shm_t * volatile g_applet_shm;   // non-NULL in parent while an in-window library applet is running
 static uint64_t g_btn;
 static int g_w, g_a, g_s, g_d;
 static int g_rl, g_ru, g_rr, g_rd;   // arrow keys pressed with Shift held: the right stick (each goes back up as it went down, whatever Shift does meanwhile)
@@ -146,6 +152,15 @@ static void cursor_hide_for_input(void) {
 static void push(void) {
     int32_t lx = (g_d - g_a) * 32767, ly = (g_w - g_s) * 32767;
     int32_t rx = (g_rr - g_rl) * 32767, ry = (g_ru - g_rd) * 32767;
+    dm_applet_shm_t *shm = g_applet_shm;
+    if (shm) {
+        atomic_store_explicit(&shm->kbd_btn, g_btn, memory_order_relaxed);
+        atomic_store_explicit(&shm->kbd_lx, lx, memory_order_relaxed);
+        atomic_store_explicit(&shm->kbd_ly, ly, memory_order_relaxed);
+        atomic_store_explicit(&shm->kbd_rx, rx, memory_order_relaxed);
+        atomic_store_explicit(&shm->kbd_ry, ry, memory_order_relaxed);
+        return;
+    }
     dm_input_set(g_btn, lx, ly, rx, ry);
 }
 static int key_bit(unsigned short code) {
@@ -197,6 +212,17 @@ static int32_t pad_axis(float v) { return (int32_t)(fmaxf(-1.f, fminf(1.f, v)) *
 static void pad_set(int p, uint64_t m, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     const int32_t dead = DM_STICK_MAX * 15 / 100;
     if (m || abs(lx) > dead || abs(ly) > dead || abs(rx) > dead || abs(ry) > dead) cursor_hide_for_input();
+    dm_applet_shm_t *shm = g_applet_shm;
+    if (shm) {
+        if (p == 0) {
+            atomic_store_explicit(&shm->pad_btn, m, memory_order_relaxed);
+            atomic_store_explicit(&shm->pad_lx, lx, memory_order_relaxed);
+            atomic_store_explicit(&shm->pad_ly, ly, memory_order_relaxed);
+            atomic_store_explicit(&shm->pad_rx, rx, memory_order_relaxed);
+            atomic_store_explicit(&shm->pad_ry, ry, memory_order_relaxed);
+        }
+        return;
+    }
     dm_pad_set_player(p, m, lx, ly, rx, ry);
 }
 static void hq_poll(void);
@@ -682,9 +708,24 @@ void front_picture_shape(int w, int h) { if (w > 0 && h > 0) g_picture_aspect = 
     double a = g_picture_aspect; if (w / h > a) w = h * a; else h = w / a;   // the centered picture the present fits into the view (16:9, or a taller one under DM_SCREEN_ASPECT)
     double x0 = (b.width - w) / 2, y0 = (b.height - h) / 2;
     dm_touch t = {0, (float)fmin(fmax((p.x - x0) / w, 0), 0.999), (float)fmin(fmax(1 - (p.y - y0) / h, 0), 0.999)};   // The AppKit view origin is at bottom left, the touchscreen origin is at top left
-    dm_touch_set(&t, 1); g_mouse_down = 1;
+    dm_applet_shm_t *shm = g_applet_shm;
+    if (shm) {
+        shm->touch[0] = t;
+        atomic_store_explicit(&shm->touch_n, 1, memory_order_release);
+    } else {
+        dm_touch_set(&t, 1);
+    }
+    g_mouse_down = 1;
 }
-- (void)mouseUp:(NSEvent *)e { (void)e; if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); } }
+- (void)mouseUp:(NSEvent *)e {
+    (void)e;
+    if (g_mouse_down) {
+        g_mouse_down = 0;
+        dm_applet_shm_t *shm = g_applet_shm;
+        if (shm) atomic_store_explicit(&shm->touch_n, 0, memory_order_release);
+        else dm_touch_set(NULL, 0);
+    }
+}
 // The drawable follows the view in pixels: a layer assigned to a layer-backed view kept the drawable at the first window's 1280x720 in fullscreen too, so the game picture was
 // scaled down to it and up again by the compositor
 - (void)fitDrawable {
@@ -1559,21 +1600,97 @@ static NSArray<NSURL *> *found_cheat_files(NSString *build) {
 }
 @end
 
+// A borderless window that can take the keyboard: the library applet process (the MiiEdit applet a game started, front_mii_editor) shows its picture in one placed exactly over the game's window
+@interface DmOverlayWindow : NSWindow @end
+@implementation DmOverlayWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+@end
+
+// Child-process side of in-window library applet rendering (DM_APPLET_SHM + DM_APPLET_NOTIFY_FD).
+static dm_applet_shm_t *g_child_shm;
+static IOSurfaceRef g_child_surf[2];
+static id<MTLTexture> g_child_tex[2];
+static void child_applet_init(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    const char *p = getenv("DM_APPLET_SHM");
+    if (!p || !*p) return;
+    int fd = open(p, O_RDWR);
+    if (fd < 0) return;
+    void *m = mmap(NULL, sizeof(dm_applet_shm_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return;
+    dm_applet_shm_t *shm = (dm_applet_shm_t *)m;
+    IOSurfaceRef s0 = IOSurfaceLookup(shm->surf_ids[0]);
+    IOSurfaceRef s1 = IOSurfaceLookup(shm->surf_ids[1]);
+    if (!s0 || !s1) {
+        if (s0) CFRelease(s0);
+        if (s1) CFRelease(s1);
+        munmap(m, sizeof(dm_applet_shm_t));
+        return;
+    }
+    g_child_shm = shm;
+    g_child_surf[0] = s0;
+    g_child_surf[1] = s1;
+}
+int front_applet_present_mode(void) {
+    child_applet_init();
+    return g_child_shm != NULL;
+}
+void *front_applet_surface_texture(int idx, void *mtl_device) {
+    if (idx < 0 || idx > 1 || !g_child_surf[idx]) return NULL;
+    if (!g_child_tex[idx]) {
+        id<MTLDevice> dev = (__bridge id<MTLDevice>)mtl_device;
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:1280 height:720 mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        d.storageMode = MTLStorageModeShared;
+        g_child_tex[idx] = [dev newTextureWithDescriptor:d iosurface:g_child_surf[idx] plane:0];
+    }
+    return (__bridge void *)g_child_tex[idx];
+}
+void front_applet_did_present(int idx) {
+    if (g_child_shm) {
+        atomic_store_explicit(&g_child_shm->frame_idx, (uint32_t)(idx & 1), memory_order_release);
+        atomic_fetch_add_explicit(&g_child_shm->frame_seq, 1, memory_order_release);
+    }
+}
+
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
     if (!getenv("DM_WINDOW")) { guest(); return; }
     @autoreleasepool {
         [NSApplication sharedApplication];
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-        NSRect r = NSMakeRect(0, 0, 1280, 720);
-        NSWindow *win = [[NSWindow alloc] initWithContentRect:r
-                                                    styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
-                                                      backing:NSBackingStoreBuffered defer:NO];
+        if (front_applet_present_mode()) {
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+            g_layer = [CAMetalLayer layer];
+            g_layer.device = MTLCreateSystemDefaultDevice();
+            g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            LOG("front end: in-window applet mode (IOSurface %u/%u, no separate window)",
+                g_child_shm->surf_ids[0], g_child_shm->surf_ids[1]);
+            static guest_arg ga; ga.fn = guest;
+            pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 64u << 20);
+            if (pthread_create(&th, &at, guest_tramp, &ga)) die("pthread_create guest");
+            [NSApp run];
+            return;
+        }
+        // DM_OVERLAY_FRAME="x,y,w,h" (screen points, origin at the screen's bottom left): this process is a library applet in front of a game, which gives the frame of its window. The applet has
+        // no Dock icon or menu bar of its own, and its window floats over the game's, in a full screen game's space too
+        double ox = 0, oy = 0, ow = 0, oh = 0; const char *ovs = getenv("DM_OVERLAY_FRAME");
+        int overlay = ovs && sscanf(ovs, "%lf,%lf,%lf,%lf", &ox, &oy, &ow, &oh) == 4 && ow > 0 && oh > 0;
+        [NSApp setActivationPolicy:overlay ? NSApplicationActivationPolicyAccessory : NSApplicationActivationPolicyRegular];
+        NSRect r = overlay ? NSMakeRect(0, 0, ow, oh) : NSMakeRect(0, 0, 1280, 720);
+        NSWindow *win = overlay ? [[DmOverlayWindow alloc] initWithContentRect:NSMakeRect(ox, oy, ow, oh) styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO]
+                                : [[NSWindow alloc] initWithContentRect:r
+                                                              styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+                                                                backing:NSBackingStoreBuffered defer:NO];
         win.title = @(DM_GAME_NAME);   // the game profile's name (game name label)
         // Fullscreen: without FullScreenPrimary the green button only zooms the window. The present path already scales
         // the game picture to fit the drawable with black bars around it, so fullscreen keeps the game's aspect ratio.
-        win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
+        if (overlay) { win.level = NSPopUpMenuWindowLevel; win.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorIgnoresCycle; win.hasShadow = NO; win.releasedWhenClosed = NO; LOG("front end: applet window over the game's, frame %.0f,%.0f %.0fx%.0f", ox, oy, ow, oh); }
+        else win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
         NSView *v = win.contentView = [[DmGameView alloc] initWithFrame:r];
         v.wantsLayer = YES;
         g_layer = [CAMetalLayer layer];
@@ -1584,10 +1701,11 @@ void front_run(void (*guest)(void)) {
         // stay unset: mode=default forces this layer's HUD on, so the Metal HUD menu's Hide HUD left it on screen
         if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) LOG("front end: Metal performance HUD on (DM_METAL_HUD)");
         v.layer = g_layer; [(DmGameView *)v fitDrawable];
-        [win center];
+        if (!overlay) [win center];
         [win makeKeyAndOrderFront:nil];
         screen_refresh(win.screen ?: NSScreen.mainScreen);
         g_win = win;
+        if (overlay) { [win orderFrontRegardless]; [NSApp activate]; }
         [NSApp activateIgnoringOtherApps:YES];
         // A host another process starts (scripts/regress.py) is not activated (its focus state stays 2), so its window opened wherever it landed in the window order, and behind
         // another app's window macOS fires its display link about once a second: Breath of the Wild stepped up to 3 vsyncs at boot and never came back (20 fps runs).
@@ -1616,7 +1734,7 @@ void front_run(void (*guest)(void)) {
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         NSApp.mainMenu = bar;
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
-        if (fs && strcmp(fs, "0")) {
+        if (fs && strcmp(fs, "0") && !overlay) {
             // A game opened from a fullscreen app starts while macOS leaves that Space. Wait for activation and for the window to reach the active Space before asking for fullscreen
             // (whichever happens last), and repeat a refused startup request once. Only a request made here owns a retry; a later player request must never restart startup handling
             static DmWinDelegate *wd; wd = [DmWinDelegate new]; win.delegate = wd;
@@ -1648,6 +1766,7 @@ void front_run(void (*guest)(void)) {
                 pads_changed(conn ? nil : c);
                 if (conn) hq_log_setting(); }];
         dm_haptics_apple_init();
+        if (overlay) GCController.shouldMonitorBackgroundEvents = YES;
         pads_start();
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
@@ -1669,8 +1788,8 @@ void front_run(void (*guest)(void)) {
         [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_fullscreen = 0; screen_refresh(win.screen); g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
         // DM_FOCUS_KEEP=1 (scripts/regress.py): the game stays in focus while its window is up, whichever app is active. Tears of the Kingdom stops presenting out of focus, so
         // another app taking the key window during an unattended run read as a hang (no frame after the last focus change)
-        static int keep = -1; if (keep < 0) keep = getenv("DM_FOCUS_KEEP") && atoi(getenv("DM_FOCUS_KEEP"));
-        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; input_release(); if (!win.miniaturized && !g_text_box && !keep) dm_focus_set(2); }];
+        static int keep = -1; if (keep < 0) keep = (getenv("DM_FOCUS_KEEP") && atoi(getenv("DM_FOCUS_KEEP"))) || overlay;
+        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; if (!overlay || g_text_box) input_release(); if (!win.miniaturized && !g_text_box && !keep) dm_focus_set(2); }];
         [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; input_resume(); dm_focus_set(1); }];
         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; input_release(); dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];
         [nc addObserverForName:NSWindowDidDeminiaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); }];
@@ -1734,6 +1853,8 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
         int min_chars = g_swkbd_min_chars > 0 ? g_swkbd_min_chars : 0;
         NSString *info = [NSString stringWithFormat:@"%s%s%s", sub ? sub : "", sub && *sub && guide && *guide ? "\n" : "", guide ? guide : ""];
         for (;;) {
+            BOOL wasProhibited = ([NSApp activationPolicy] == NSApplicationActivationPolicyProhibited);
+            if (wasProhibited) [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
             NSAlert *a = [NSAlert new];
             a.messageText = title && *title ? @(title) : @"Input";
             a.informativeText = info;
@@ -1742,7 +1863,14 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
             f.stringValue = text ?: (initial ? @(initial) : @"");
             if (guide && *guide) f.placeholderString = @(guide);
             a.accessoryView = f; a.window.initialFirstResponder = f;
+            [NSApp activateIgnoringOtherApps:YES];
+            [a layout];
+            NSWindow *game = g_win;
+            if (game && a.window.level <= game.level) a.window.level = game.level + 1;
+            if (!game) a.window.level = NSFloatingWindowLevel;
             g_text_box = 1; r = [a runModal] == NSAlertFirstButtonReturn; g_text_box = 0;
+            if (wasProhibited) [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+            if (game) { [game makeKeyAndOrderFront:nil]; input_resume(); }
             text = f.stringValue;
             if (!r || (int)text.length >= min_chars) break;
             // On hardware the applet would not have accepted the shorter text (OK stayed disabled); a game that rejects it re-opens the keyboard for ever, so the box comes back with the rule instead
@@ -1777,9 +1905,171 @@ void front_error_dialog(const char *code, const char *msg) {
     });
 }
 
-// Native Mii editor (front.h): NSAlert with custom accessory view for creating or editing a Mii
+// Native Mii editor (front.h): launches the real Switch MiiEdit library applet overlaid on the game window when present, else NSAlert
+const char *dm_system_dir(char *buf, size_t n);
+static _Atomic int g_last_miiedit_index = -1;
+int front_mii_editor_last_index(void) { return atomic_load_explicit(&g_last_miiedit_index, memory_order_relaxed); }
 int front_mii_editor(void *charinfo_out, int is_new) {
+    atomic_store_explicit(&g_last_miiedit_index, -1, memory_order_relaxed);
     if (!g_layer) return -1;
+    char app_buf[1024] = {0}, bin_buf[1024] = {0}, dm_buf[1024] = {0};
+    char font_buf[1024] = {0}, shmap_buf[1024] = {0}, msl_buf[1024] = {0}, rom_buf[1024] = {0};
+    const char *app_cands[4] = { getenv("DM_MIIEDIT_APP"), NULL, NULL, NULL };
+    char res_app[1024] = {0}, home_app[1024] = {0};
+    NSString *resPath = [[NSBundle mainBundle] resourcePath];
+    if (resPath) {
+        snprintf(res_app, sizeof res_app, "%s/miiedit.app", [resPath UTF8String]);
+        app_cands[1] = res_app;
+    }
+    const char *home = getenv("HOME");
+    if (home && *home) {
+        snprintf(home_app, sizeof home_app, "%s/Library/Application Support/nxnative/miiedit/miiedit.app", home);
+        app_cands[2] = home_app;
+    }
+    for (int i = 0; app_cands[i] || i < 3; i++) {
+        if (!app_cands[i] || !*app_cands[i]) continue;
+        snprintf(bin_buf, sizeof bin_buf, "%s/Contents/MacOS/dmhost", app_cands[i]);
+        snprintf(dm_buf, sizeof dm_buf, "%s/Contents/Resources/dm", app_cands[i]);
+        if (access(bin_buf, X_OK) == 0 && access(dm_buf, R_OK) == 0) {
+            strlcpy(app_buf, app_cands[i], sizeof app_buf);
+            break;
+        }
+        bin_buf[0] = dm_buf[0] = 0;
+    }
+    if (app_buf[0]) {
+        snprintf(font_buf, sizeof font_buf, "%s/font", dm_buf);
+        snprintf(shmap_buf, sizeof shmap_buf, "%s/shader_map.tsv", dm_buf);
+        snprintf(msl_buf, sizeof msl_buf, "%s/shader_cache", dm_buf);
+        if (access(msl_buf, R_OK) != 0) msl_buf[0] = 0;
+        snprintf(rom_buf, sizeof rom_buf, "%s/romfs.bin", dm_buf);
+        if (access(rom_buf, R_OK) != 0) {
+            snprintf(rom_buf, sizeof rom_buf, "%s/Contents/PlugIns/GameData.bundle/Contents/Resources/romfs.img", app_buf);
+            if (access(rom_buf, R_OK) != 0) rom_buf[0] = 0;
+        }
+        char shm_path[256];
+        snprintf(shm_path, sizeof shm_path, "/tmp/dm_applet_%d.shm", (int)getpid());
+        int shm_fd = open(shm_path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+        if (shm_fd >= 0 && ftruncate(shm_fd, sizeof(dm_applet_shm_t)) == 0) {
+            dm_applet_shm_t *shm = mmap(NULL, sizeof(dm_applet_shm_t), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+            close(shm_fd);
+            int w = 1280, h = 720, bpp = 4, bpr = w * bpp, sz = bpr * h;
+            uint32_t fmt = 0x42475241; // 'BGRA'
+            NSDictionary *sdict = @{
+                (__bridge NSString *)kIOSurfaceWidth: @(w),
+                (__bridge NSString *)kIOSurfaceHeight: @(h),
+                (__bridge NSString *)kIOSurfaceBytesPerElement: @(bpp),
+                (__bridge NSString *)kIOSurfaceBytesPerRow: @(bpr),
+                (__bridge NSString *)kIOSurfaceAllocSize: @(sz),
+                (__bridge NSString *)kIOSurfacePixelFormat: @(fmt),
+                (__bridge NSString *)kIOSurfaceIsGlobal: @YES,
+            };
+            IOSurfaceRef surfs[2] = { IOSurfaceCreate((__bridge CFDictionaryRef)sdict), IOSurfaceCreate((__bridge CFDictionaryRef)sdict) };
+            if (shm != MAP_FAILED && surfs[0] && surfs[1]) {
+                memset(shm, 0, sizeof *shm);
+                shm->surf_ids[0] = IOSurfaceGetID(surfs[0]);
+                shm->surf_ids[1] = IOSurfaceGetID(surfs[1]);
+                __block CALayer *appletLayer = nil;
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
+                    dm_touch_set(NULL, 0);
+                    g_applet_shm = shm;
+                    if (g_win && g_win.contentView && g_win.contentView.layer) {
+                        appletLayer = [CALayer layer];
+                        appletLayer.frame = g_win.contentView.bounds;
+                        appletLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+                        appletLayer.contentsGravity = kCAGravityResizeAspect;
+                        appletLayer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+                        appletLayer.zPosition = 100;
+                        [g_win.contentView.layer addSublayer:appletLayer];
+                    }
+                });
+                dm_audio_set_duck(0.20f);
+                __block uint32_t last_seq = 0;
+                IOSurfaceRef s0 = surfs[0], s1 = surfs[1];
+                dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+                dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 8000000ull, 1000000ull);
+                dispatch_source_set_event_handler(timer, ^{
+                    uint32_t seq = atomic_load_explicit(&shm->frame_seq, memory_order_acquire);
+                    if (seq != last_seq && appletLayer) {
+                        last_seq = seq;
+                        uint32_t idx = atomic_load_explicit(&shm->frame_idx, memory_order_acquire) & 1;
+                        [CATransaction begin];
+                        [CATransaction setDisableActions:YES];
+                        appletLayer.contents = (__bridge id)(idx ? s1 : s0);
+                        [CATransaction commit];
+                    }
+                });
+                dispatch_resume(timer);
+                char sys_buf[1024];
+                const char *sys = dm_system_dir(sys_buf, sizeof sys_buf);
+                NSTask *task = [[NSTask alloc] init];
+                task.executableURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:bin_buf]];
+                task.arguments = @[[NSString stringWithUTF8String:dm_buf]];
+                NSMutableDictionary *env = [[[NSProcessInfo processInfo] environment] mutableCopy];
+                env[@"DM_WINDOW"] = @"1";
+                env[@"DM_AUDIO"] = @"1";
+                env[@"DM_APPLET_SHM"] = [NSString stringWithUTF8String:shm_path];
+                env[@"DM_MIIEDIT_MODE"] = is_new ? @"1" : @"0";
+                env[@"DM_SYSTEM_DIR"] = [NSString stringWithUTF8String:sys];
+                env[@"DM_ROOT"] = [NSString stringWithUTF8String:dm_buf];
+                if (access(font_buf, R_OK) == 0) env[@"DM_FONT_DIR"] = [NSString stringWithUTF8String:font_buf];
+                if (msl_buf[0]) env[@"DM_MSL_DIR"] = [NSString stringWithUTF8String:msl_buf];
+                if (access(shmap_buf, R_OK) == 0) env[@"DM_NVN_SHMAP"] = [NSString stringWithUTF8String:shmap_buf];
+                if (rom_buf[0]) env[@"DM_ROMFS_BIN"] = [NSString stringWithUTF8String:rom_buf];
+                [env removeObjectForKey:@"DM_ROMFS"];
+                [env removeObjectForKey:@"DM_PSO_BUNDLE"];
+                [env removeObjectForKey:@"DM_PSO_PAIRS"];
+                [env removeObjectForKey:@"DM_FULLSCREEN"];
+                [env removeObjectForKey:@"DM_OVERLAY_FRAME"];
+                task.environment = env;
+                NSError *err = nil;
+                BOOL launched = [task launchAndReturnError:&err];
+                if (launched) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        if (g_win) {
+                            [g_win makeKeyAndOrderFront:nil];
+                            [NSApp activateIgnoringOtherApps:YES];
+                        }
+                    });
+                    [task waitUntilExit];
+                }
+                dispatch_source_cancel(timer);
+                dm_audio_set_duck(1.0f);
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    g_applet_shm = NULL;
+                    g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
+                    dm_touch_set(NULL, 0);
+                    [CATransaction begin];
+                    [CATransaction setDisableActions:YES];
+                    [appletLayer removeFromSuperlayer];
+                    [CATransaction commit];
+                    appletLayer = nil;
+                });
+                uint32_t out_ready = atomic_load_explicit(&shm->out_ready, memory_order_acquire);
+                int32_t out_res = atomic_load_explicit(&shm->out_result, memory_order_relaxed);
+                int32_t out_idx = atomic_load_explicit(&shm->out_index, memory_order_relaxed);
+                CFRelease(surfs[0]);
+                CFRelease(surfs[1]);
+                munmap(shm, sizeof *shm);
+                unlink(shm_path);
+                if (launched) {
+                    if (out_ready) {
+                        atomic_store_explicit(&g_last_miiedit_index, out_idx, memory_order_relaxed);
+                        return (out_res == 0) ? 2 : 0; // 2 = saved (reload DB), 0 = canceled
+                    }
+                    return 2;
+                }
+            } else {
+                if (surfs[0]) CFRelease(surfs[0]);
+                if (surfs[1]) CFRelease(surfs[1]);
+                if (shm != MAP_FAILED) munmap(shm, sizeof *shm);
+                unlink(shm_path);
+            }
+        } else if (shm_fd >= 0) {
+            close(shm_fd);
+            unlink(shm_path);
+        }
+    }
     mii_charinfo *c = (mii_charinfo *)charinfo_out;
     __block int result = 0;
     dispatch_sync(dispatch_get_main_queue(), ^{

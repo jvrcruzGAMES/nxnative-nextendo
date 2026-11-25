@@ -3379,6 +3379,17 @@ def main(args=None):
         run(['dotnet', 'run', '--project', str(repo / 'dm/tools/fw_extract/fw_extract.csproj'), '--', str(keys), str(fw_path), str(fw_sys)], fw_log, env=env)
         PROG.end(f'{fw_path.name}')
         say(f'firmware system data: extracted to {fw_sys}')
+        bntx_icon = fw_sys / 'applets/0100000000001009/RomFS/lyt/Texture/IconAll.bntx'
+        if bntx_icon.is_file():
+            mii_icons_dir = fw_sys / 'mii_icons'
+            try:
+                run([py, str(repo / 'dm/tools/extract_mii_icons.py'), str(bntx_icon), str(mii_icons_dir)], fw_log, env=env)
+                bntx_base = fw_sys / 'applets/0100000000001009/RomFS/lyt/Texture/IconEditBaseAll.bntx'
+                if bntx_base.is_file():
+                    run([py, str(repo / 'dm/tools/extract_mii_icons.py'), str(bntx_base), str(mii_icons_dir)], fw_log, env=env)
+                say(f'Mii editor 2D icons: extracted {len(list(mii_icons_dir.glob("*.png")))} icons to {mii_icons_dir}')
+            except Exception as e:
+                say(f'[WARN] failed to extract Mii icons: {e}')
 
     picks = pick_nsps(fam, have, versions)
 

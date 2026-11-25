@@ -120,6 +120,12 @@ static void *nvn_lookup(const char *name) {
 HLE_FORCE("nvnBootstrapLoader", "the NVN graphics API is replaced wholesale with a host null device (Metal behind it); the SDK's NVN driver does not run",
           void *, h_nvnBootstrapLoader, const char *name) { return nvn_lookup(name); }
 
+void *h_nvn_static_bootstrap(void *dev, const char *name) {
+    if (!name && dev) return nvn_lookup((const char *)dev);
+    if (name) return nvn_lookup(name);
+    return NULL;
+}
+
 // ---------- Boolean parameters: Switch callers do not extend them, only look at the low 8 bits ----------
 #define B(x) ((x) & 0xff)
 
@@ -851,6 +857,7 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
 
 // ---------- Sync / events ----------
 NVN(nvnSyncInitialize, NVNboolean, NVNsync *s, NVNdevice *d) { (void)d; *(sync_t *)s = (sync_t){MAGIC('S', 'Y', 'N', 'C'), 0, 0}; return 1; }
+NVN_NOPROTO(nvnSyncInitializeFromNvRmSyncNVX, NVNboolean, NVNsync *s, NVNdevice *d, const void *f) { (void)d; (void)f; *(sync_t *)s = (sync_t){MAGIC('S', 'Y', 'N', 'C'), 0, 0}; return 1; }
 NVN(nvnSyncFinalize, void, NVNsync *s) { nvn_sync_release((sync_t *)s); ((sync_t *)s)->magic = 0; }
 NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
@@ -2605,6 +2612,9 @@ static const int *present_crop(const int win[4], int tw, int th, int lc[4]) {
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
+    if (o->presents <= 10 || (o->presents % 60 == 0)) {
+        LOG("[nvn] QueuePresentTexture #%llu idx=%d", (unsigned long long)o->presents, idx);
+    }
     dm_ue_cvar_tick();
     if (fps_high()) high_cap_tick();
     int movie = dm_movie_hz();

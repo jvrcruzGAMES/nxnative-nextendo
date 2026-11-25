@@ -2,6 +2,7 @@
 // On the real device each goes through IPC or a system applet; the host gives results as single-player offline. Pure-computation SDK parts (hash, util, software Opus) are not taken over, the original implementation is used directly.
 #include "hle.h"
 #include "front.h"
+#include "hle_nextendo.h"
 #include <dirent.h>
 
 __attribute__((weak)) void front_error_dialog(const char *code, const char *msg) {
@@ -185,13 +186,49 @@ HLE_FORCE("_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPDsj", "profa
 HLE_FORCE("_ZN2nn3ngc15ProfanityFilter11SetMaskModeENS1_8MaskModeE", "profanity mask mode; nothing is masked whatever the mode", void, h_ngc_MaskMode, void *self, int mode) { (void)self; (void)mode; }
 HLE_FORCE("_ZN2nn3ngc15ProfanityFilter8FinalizeEv", "profanity filter shutdown; the host mounted no word list", void, h_ngc_Fini, void *self) { (void)self; }
 
-// ---------- nsd server name resolution / pctl free communication: networking, out of scope ----------
-HLE_FORCE("_ZN2nn3nsd7ResolveEPNS0_4FqdnERKS1_", "server name resolution, networking out of scope; cut", Result, h_nsd_Resolve, void *out, const void *in) { (void)out; (void)in; return RES_FAIL; }
-HLE_FORCE("_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_", "server name resolution, networking out of scope; cut", Result, h_nsd_ResolveEx, void *out, const void *in) { (void)out; (void)in; return RES_FAIL; }
+// ---------- nsd server name resolution ----------
+static Result nsd_resolve_fqdn(void *out, const void *in) {
+    if (!out) return RES_FAIL;
+    if (!in) {
+        ((char *)out)[0] = '\0';
+        return RES_OK;
+    }
+    const char *src = (const char *)in;
+    char *dst = (char *)out;
+    size_t d = 0;
+    for (size_t s = 0; src[s] && d < 255; s++) {
+        if (src[s] == '%') {
+            if (d + 3 < 255) {
+                dst[d++] = 'l';
+                dst[d++] = 'p';
+                dst[d++] = '1';
+            }
+        } else {
+            dst[d++] = src[s];
+        }
+    }
+    dst[d] = '\0';
+    LOG("[NSD] Resolve in='%s' -> out='%s'", src, dst);
+    return RES_OK;
+}
+
+HLE_FORCE("_ZN2nn3nsd7ResolveEPNS0_4FqdnERKS1_", "nsd server name resolution", Result, h_nsd_Resolve, void *out, const void *in) {
+    return nsd_resolve_fqdn(out, in);
+}
+HLE_FORCE("_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_", "nsd server name resolution (ex)", Result, h_nsd_ResolveEx, void *out, const void *in) {
+    return nsd_resolve_fqdn(out, in);
+}
+HLE_FORCE("_ZN2nn3nsd6detail3ipc7ResolveEPNS0_4FqdnERKS3_", "nsd::detail::ipc::Resolve", Result, h_nsd_ipc_Resolve, void *out, const void *in) {
+    return nsd_resolve_fqdn(out, in);
+}
+HLE_FORCE("_ZN2nn3nsd6detail3ipc9ResolveExEPNS_6ResultEPNS0_4FqdnERKS5_", "nsd::detail::ipc::ResolveEx", Result, h_nsd_ipc_ResolveEx, Result *res, void *out, const void *in) {
+    if (res) *res = RES_OK;
+    return nsd_resolve_fqdn(out, in);
+}
 // bool arguments only look at the low 8 bits; returns bool
 // The permission query answers as TryBegin / IsFreeCommunicationAvailable do: the SDK's version calls the pctl service (pctl::detail::ipc::GetService), which the host never opens (DRAGON QUEST XI S imports it; from PR #38)
-HLE_FORCE("_ZN2nn4pctl32CheckFreeCommunicationPermissionEb", "parental controls · permission to communicate with others, networking out of scope; never, no system UI", unsigned, h_pctl_CheckFree, unsigned show_ui) { (void)show_ui; return 0; }
-HLE_FORCE("_ZN2nn4pctl25TryBeginFreeCommunicationEb", "parental controls · communication with others, networking out of scope; never allowed", unsigned, h_pctl_TryBegin, unsigned show_ui) { (void)show_ui; return 0; }
+HLE_FORCE("_ZN2nn4pctl32CheckFreeCommunicationPermissionEb", "parental controls · permission to communicate with others, networking out of scope; never, no system UI", unsigned, h_pctl_CheckFree, unsigned show_ui) { (void)show_ui; return nextendo_enabled() ? 1 : 0; }
+HLE_FORCE("_ZN2nn4pctl25TryBeginFreeCommunicationEb", "parental controls · communication with others, networking out of scope; never allowed", unsigned, h_pctl_TryBegin, unsigned show_ui) { (void)show_ui; return nextendo_enabled() ? 1 : 0; }
 // Parental control of the 3D (VR goggles) mode, Super Mario Odyssey: no restriction, nothing to configure
 HLE_FORCE("_ZN2nn4pctl26GetStereoVisionRestrictionEv", "parental controls · 3D view restriction; never restricted", unsigned, h_pctl_GetStereo, void) { return 0; }
 HLE_FORCE("_ZN2nn4pctl26SetStereoVisionRestrictionEb", "parental controls · 3D view restriction; the host does not store it", void, h_pctl_SetStereo, unsigned on) { (void)on; }
@@ -199,10 +236,10 @@ HLE_FORCE("_ZN2nn4pctl42ConfirmStereoVisionRestrictionConfigurableEv", "parental
 HLE_FORCE("_ZN2nn4pctl53RequestStereoVisionRestrictionConfigurationPermissionEv", "parental controls · permission to change the 3D restriction; granted at once", Result, h_pctl_ReqStereo, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn4pctl20EndFreeCommunicationEv", "parental controls · communication with others", void, h_pctl_End, void) {}
 // Engage asks on entering a battle map (no UI); without this the SDK connects to the pctl service through sm, which the host does not have, and aborts
-HLE_FORCE("_ZN2nn4pctl28IsFreeCommunicationAvailableEv", "parental controls · whether communication with others is available, networking out of scope; never", unsigned, h_pctl_IsFree, void) { return 0; }
+HLE_FORCE("_ZN2nn4pctl28IsFreeCommunicationAvailableEv", "parental controls · whether communication with others is available, networking out of scope; never", unsigned, h_pctl_IsFree, void) { return nextendo_enabled() ? 1 : 0; }
 // The Legend of Zelda: Breath of the Wild: checks the parental-control permission for stereoscopic 3D before turning on the options' Labo VR mode (returns bool; the argument = whether to
 // show UI, the game passes 0). The host has no VR display (pl::BeginVrMode refuses, hle_sdk16.c): not permitted, so the game clears its VR flag and stays 2D (as MacNativeGames found on 1.6.0 and 1.9.0)
-HLE_FORCE("_ZN2nn4pctl33CheckAgcPermissionUnderMinimumAgeERKNS_7account3UidE", "parental controls · a user's permission under the minimum age (SDK 22), networking out of scope; never", unsigned, h_pctl_CheckAgc, const void *uid) { (void)uid; return 0; }
+HLE_FORCE("_ZN2nn4pctl33CheckAgcPermissionUnderMinimumAgeERKNS_7account3UidE", "parental controls · a user's permission under the minimum age (SDK 22), networking out of scope; never", unsigned, h_pctl_CheckAgc, const void *uid) { (void)uid; return nextendo_enabled() ? 1 : 0; }
 HLE_FORCE("_ZN2nn4pctl27CheckStereoVisionPermissionEb", "parental controls · stereoscopic 3D permission; the host has no VR display, not permitted", unsigned, h_pctl_Stereo, unsigned show_ui) { (void)show_ui; return 0; }
 
 // swkbd software keyboard: see hle_swkbd.c

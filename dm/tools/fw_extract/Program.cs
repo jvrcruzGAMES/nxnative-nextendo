@@ -109,14 +109,14 @@ static class Program {
                         }
                         Console.WriteLine($"[firmware] extracted MiiEdit ({tid:x16}) to {appletDir}");
                         extractedCount++;
-                    } else if (tid == 0x0100000000000809UL) {
-                        // TimeZoneBinary
+                    } else if (tid == 0x0100000000000809UL || (tid >= 0x0100000000000800UL && tid <= 0x01000000000008ffUL)) {
+                        // System Data Archives (e.g. 081e oceanShared, 0809 TimeZoneBinary, etc.)
                         if (nca.CanOpenSection(NcaSectionType.Data)) {
                             IFileSystem romfs = nca.OpenFileSystem(NcaSectionType.Data, IntegrityCheckLevel.IgnoreOnInvalid);
                             string dst = Path.Combine(outDir, "sysdata", $"{tid:x16}");
                             Directory.CreateDirectory(dst);
                             CopyFileSystem(romfs, dst);
-                            Console.WriteLine($"[firmware] extracted TimeZoneBinary ({tid:x16}) to {dst}");
+                            Console.WriteLine($"[firmware] extracted SystemData ({tid:x16}) to {dst}");
                             extractedCount++;
                         }
                     }

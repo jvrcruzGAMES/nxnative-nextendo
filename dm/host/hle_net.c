@@ -33,6 +33,7 @@ HLE_FORCE("_ZN2nn4nifm18IsNetworkAvailableEv", "network availability", int, h_ni
     if (nextendo_enabled()) return 1;
     return 0;
 }
+HLE_FORCE("_ZN2nn4nifm26HandleNetworkRequestResultEv", "handle network request result", Result, h_nifm_HandleReqResult, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", "offline: not resolved, shows no system network screen", unsigned, h_nifm_HandleErr, void) { return 0; }
 HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEPNS_6socket6InAddrE", "primary IP address", Result, h_nifm_GetIp, uint32_t *a) {
     if (nextendo_enabled()) {
@@ -46,8 +47,72 @@ HLE_FORCE("nnsslInitialize", "connects to the ssl service", Result, h_ssl_Initia
 HLE_FORCE("nnsslFinalize", "pairs with nnsslInitialize", Result, h_ssl_Finalize, void) { return RES_OK; }
 
 // ---------- BSD service: local UDP/EventFd work offline; real sockets when Nextendo is active ----------
-#define SK_ENETDOWN 50
+#define SK_ENETDOWN 100
 static __thread int t_skerr = SK_ENETDOWN;
+static int host_errno_to_switch(int err) {
+    switch (err) {
+        case 0: return 0;
+        case EPERM: return 1;
+        case ENOENT: return 2;
+        case ESRCH: return 3;
+        case EINTR: return 4;
+        case EIO: return 5;
+        case ENXIO: return 6;
+        case E2BIG: return 7;
+        case ENOEXEC: return 8;
+        case EBADF: return 9;
+        case ECHILD: return 10;
+        case EAGAIN: return 11;
+        case ENOMEM: return 12;
+        case EACCES: return 13;
+        case EFAULT: return 14;
+        case EBUSY: return 16;
+        case EEXIST: return 17;
+        case EXDEV: return 18;
+        case ENODEV: return 19;
+        case ENOTDIR: return 20;
+        case EISDIR: return 21;
+        case EINVAL: return 22;
+        case ENFILE: return 23;
+        case EMFILE: return 24;
+        case ENOTTY: return 25;
+        case ETXTBSY: return 26;
+        case EFBIG: return 27;
+        case ENOSPC: return 28;
+        case ESPIPE: return 29;
+        case EROFS: return 30;
+        case EMLINK: return 31;
+        case EPIPE: return 32;
+        case EDOM: return 33;
+        case ERANGE: return 34;
+        case EDEADLK: return 35;
+        case ENAMETOOLONG: return 36;
+        case ENOLCK: return 37;
+        case ENOSYS: return 38;
+        case ENOTEMPTY: return 39;
+        case ELOOP: return 40;
+        case EMSGSIZE: return 90;
+        case EOPNOTSUPP: return 95;
+        case EADDRINUSE: return 98;
+        case EADDRNOTAVAIL: return 99;
+        case ENETDOWN: return 100;
+        case ENETUNREACH: return 101;
+        case ENETRESET: return 102;
+        case ECONNABORTED: return 103;
+        case ECONNRESET: return 104;
+        case ENOBUFS: return 105;
+        case EISCONN: return 106;
+        case ENOTCONN: return 107;
+        case ESHUTDOWN: return 108;
+        case ETIMEDOUT: return 110;
+        case ECONNREFUSED: return 111;
+        case EHOSTDOWN: return 112;
+        case EHOSTUNREACH: return 113;
+        case EALREADY: return 114;
+        case EINPROGRESS: return 115;
+        default: return err;
+    }
+}
 static int sk_error(int error) { t_skerr = error; return -1; }
 static int sk_fail(void) { return sk_error(SK_ENETDOWN); }
 int dm_sk_errno(void) { return t_skerr; }
@@ -56,8 +121,9 @@ void dm_guest_sleep_ns(int64_t ns);
 void dm_guest_cond_wait_ns(pthread_cond_t *c, pthread_mutex_t *m, int64_t ns);
 static int sk_idle(int64_t ms) { dm_guest_sleep_ns((ms < 0 ? 100 : ms) * 1000000); return 0; }
 typedef struct { int32_t fd; int16_t events, revents; } sk_pollfd;
-enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POLLWRNORM = 4, SK_POLLNVAL = 0x20,
-       SK_EBADF = 9, SK_EAGAIN = 35, SK_EINVAL = 22, SK_EMSGSIZE = 40, SK_EOPNOTSUPP = 45, SK_EADDRINUSE = 48, SK_ENOTCONN = 57,
+enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLERR = 8, SK_POLLHUP = 0x10, SK_POLLNVAL = 0x20, SK_POLLRDNORM = 0x40, SK_POLLWRNORM = 4,
+       SK_EBADF = 9, SK_EAGAIN = 11, SK_EINVAL = 22, SK_EMSGSIZE = 90, SK_EOPNOTSUPP = 95, SK_EADDRINUSE = 98,
+       SK_ENOTCONN = 107, SK_EINPROGRESS = 115, SK_ETIMEDOUT = 110, SK_ECONNREFUSED = 111,
        SK_NONBLOCK = 0x800, SK_MSG_PEEK = 2, SK_MSG_DONTWAIT = 0x80, SK_EFD = 1, SK_UDP = 2, SK_TCP = 3,
        SK_UDP_MAX = 65507, SK_QUEUE_MAX = 1024 * 1024, SK_PACKET_MAX = 256, SK_DEFAULT_BUF = 256 * 1024 };
 typedef struct sk_packet { struct sk_packet *next; uint32_t addr; uint16_t port; size_t size; uint8_t data[]; } sk_packet;
@@ -65,6 +131,7 @@ static struct {
     uint64_t count, generation; int used, flags, fdflags, real_fd;
     uint32_t addr, peer_addr; uint16_t port, peer_port;
     int connected, shut_read, shut_write, reuse, broadcast, rcvbuf, sndbuf;
+    int so_error;
     int64_t recv_timeout, send_timeout; sk_packet *head, *tail; size_t queued; unsigned packets;
 } g_efd[EFD_MAX];
 static uint64_t g_sk_generation;
@@ -94,7 +161,7 @@ int dm_sk_socket(int family, int type, int protocol) {
     }
     if (type == 1 && (!protocol || protocol == 6)) { // SOCK_STREAM / TCP
         int real = socket(AF_INET, SOCK_STREAM, 0);
-        if (real < 0) return sk_error(errno);
+        if (real < 0) return sk_error(host_errno_to_switch(errno));
         int nosig = 1;
         setsockopt(real, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
         dm_host_mutex_lock(&g_efd_m);
@@ -102,6 +169,7 @@ int dm_sk_socket(int family, int type, int protocol) {
         if (fd >= 0) g_efd[fd].real_fd = real;
         else close(real);
         pthread_mutex_unlock(&g_efd_m);
+        LOG("[Socket] socket(TCP) -> guest_fd=%d real_fd=%d", fd, real);
         return fd;
     }
     if (type == 2 && (!protocol || protocol == 17)) { // SOCK_DGRAM / UDP
@@ -111,6 +179,7 @@ int dm_sk_socket(int family, int type, int protocol) {
         if (fd >= 0) g_efd[fd].real_fd = real;
         else if (real >= 0) close(real);
         pthread_mutex_unlock(&g_efd_m);
+        LOG("[Socket] socket(UDP) -> guest_fd=%d real_fd=%d", fd, real);
         return fd;
     }
     return sk_fail();
@@ -190,7 +259,7 @@ int dm_sk_bind(int fd, const void *a, unsigned n) {
         sa.sin_port = htons(port);
         sa.sin_addr.s_addr = htonl(addr);
         if (bind(real, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-            int err = errno;
+            int err = host_errno_to_switch(errno);
             pthread_mutex_unlock(&g_efd_m);
             return sk_error(err);
         }
@@ -228,23 +297,53 @@ int dm_sk_connect(int fd, const void *a, unsigned n) {
         sa.sin_family = AF_INET;
         sa.sin_port = htons(port);
         sa.sin_addr.s_addr = htonl(addr);
+        LOG("[Socket] connect(fd=%d, real_fd=%d, addr=%u.%u.%u.%u, port=%u)",
+            fd, real, (addr>>24)&0xff, (addr>>16)&0xff, (addr>>8)&0xff, addr&0xff, port);
         int cr = connect(real, (struct sockaddr *)&sa, sizeof(sa));
         if (cr < 0) {
             if (errno == EINPROGRESS) {
-                g_efd[fd].connected = 1;
+                // Nextendo: synchronous completion optimization (wait up to 500ms for remote SYN-ACK)
+                struct pollfd pfd = { real, POLLOUT, 0 };
+                int pr = poll(&pfd, 1, 500);
+                if (pr > 0 && (pfd.revents & POLLOUT)) {
+                    int sock_err = 0;
+                    socklen_t elen = sizeof(sock_err);
+                    getsockopt(real, SOL_SOCKET, SO_ERROR, &sock_err, &elen);
+                    if (sock_err == 0) {
+                        g_efd[fd].connected = 1;
+                        g_efd[fd].peer_addr = addr;
+                        g_efd[fd].peer_port = port;
+                        pthread_mutex_unlock(&g_efd_m);
+                        LOG("[Socket] connect completed synchronously -> SUCCESS (fd=%d, real_fd=%d)", fd, real);
+                        return 0;
+                    } else {
+                        int sw_err = host_errno_to_switch(sock_err);
+                        g_efd[fd].connected = 0;
+                        g_efd[fd].so_error = sw_err;
+                        pthread_mutex_unlock(&g_efd_m);
+                        LOG("[Socket] connect completed synchronously with error=%d (fd=%d, real_fd=%d)", sw_err, fd, real);
+                        return sk_error(sw_err);
+                    }
+                }
+                g_efd[fd].connected = 0;
                 g_efd[fd].peer_addr = addr;
                 g_efd[fd].peer_port = port;
                 pthread_mutex_unlock(&g_efd_m);
-                return sk_error(36); // EINPROGRESS
+                LOG("[Socket] connect EINPROGRESS (fd=%d, real_fd=%d)", fd, real);
+                return sk_error(SK_EINPROGRESS);
             }
-            int err = errno;
+            int err = host_errno_to_switch(errno);
+            g_efd[fd].connected = 0;
+            g_efd[fd].so_error = err;
             pthread_mutex_unlock(&g_efd_m);
+            LOG("[Socket] connect FAILED errno=%d (fd=%d, real_fd=%d)", err, fd, real);
             return sk_error(err);
         }
         g_efd[fd].connected = 1;
         g_efd[fd].peer_addr = addr;
         g_efd[fd].peer_port = port;
         pthread_mutex_unlock(&g_efd_m);
+        LOG("[Socket] connect SUCCESS (fd=%d, real_fd=%d)", fd, real);
         return 0;
     }
     int r = 0;
@@ -341,7 +440,20 @@ int dm_sk_getopt(int fd, int level, int option, void *value, unsigned *size) {
         int64_t tv[2] = {ns / 1000000000, ns % 1000000000 / 1000}; memcpy(value, tv, sizeof tv); *size = sizeof tv;
     } else if (*size < sizeof v) r = sk_error(SK_EINVAL);
     else {
-        if (option == 0x1008) v = 2; else if (option == 0x1007) v = 0; else if (option == 0x1016) v = 17;
+        if (option == 0x1008) v = 2;
+        else if (option == 0x1007) { // SO_ERROR
+            if (g_efd[fd].so_error) {
+                v = g_efd[fd].so_error;
+                g_efd[fd].so_error = 0;
+            } else if (g_efd[fd].real_fd >= 0) {
+                int err = 0;
+                socklen_t elen = sizeof(err);
+                getsockopt(g_efd[fd].real_fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+                v = host_errno_to_switch(err);
+            } else {
+                v = 0;
+            }
+        } else if (option == 0x1016) v = 17;
         else if (option == 4 || option == 0x200) v = !!(g_efd[fd].reuse & option);
         else if (option == 0x20) v = g_efd[fd].broadcast;
         else if (option == 0x1001) v = g_efd[fd].sndbuf; else if (option == 0x1002) v = g_efd[fd].rcvbuf;
@@ -365,7 +477,7 @@ long dm_sk_sendto(int fd, const void *data, unsigned long n, int flags, const vo
     if (g_efd[fd].used == SK_TCP && real >= 0) {
         pthread_mutex_unlock(&g_efd_m);
         ssize_t sent = send(real, data, n, 0);
-        if (sent < 0) return sk_error(errno == EAGAIN ? SK_EAGAIN : errno);
+        if (sent < 0) return sk_error(host_errno_to_switch(errno));
         return (long)sent;
     }
 
@@ -396,7 +508,7 @@ long dm_sk_sendto(int fd, const void *data, unsigned long n, int flags, const vo
         sa.sin_addr.s_addr = htonl(addr);
         pthread_mutex_unlock(&g_efd_m);
         ssize_t sent = sendto(real, data, n, 0, (struct sockaddr *)&sa, sizeof(sa));
-        if (sent < 0) return sk_error(errno == EAGAIN ? SK_EAGAIN : errno);
+        if (sent < 0) return sk_error(host_errno_to_switch(errno));
         return (long)sent;
     } else {
         r = (long)n;
@@ -426,7 +538,7 @@ long dm_sk_recvfrom(int fd, void *data, unsigned long n, int flags, void *a, uns
         pthread_mutex_unlock(&g_efd_m);
         int hflags = (flags & SK_MSG_PEEK ? MSG_PEEK : 0) | (flags & SK_MSG_DONTWAIT ? MSG_DONTWAIT : 0);
         ssize_t recvd = recv(real, data, n, hflags);
-        if (recvd < 0) return sk_error(errno == EAGAIN ? SK_EAGAIN : errno);
+        if (recvd < 0) return sk_error(host_errno_to_switch(errno));
         return (long)recvd;
     }
     if (!sk_udp_locked(fd)) { t_skerr = SK_EBADF; goto done; }
@@ -475,11 +587,45 @@ static int efd_ready(sk_pollfd *p, uint64_t n, uint64_t open, const uint64_t gen
         p[i].revents = 0; int fd = p[i].fd;
         if (fd < 0 || fd >= EFD_MAX || !(open >> fd & 1)) continue;
         if (!sk_used(fd) || g_efd[fd].generation != generation[fd]) { p[i].revents = SK_POLLNVAL; ready++; continue; }
+        if (g_efd[fd].real_fd >= 0) continue; // Real host descriptors are handled exclusively by host poll
         if (g_efd[fd].used == SK_EFD ? g_efd[fd].count != 0 : (g_efd[fd].head != NULL || g_efd[fd].shut_read)) p[i].revents |= p[i].events & (SK_POLLIN | SK_POLLRDNORM);
         if (g_efd[fd].used == SK_EFD || !g_efd[fd].shut_write) p[i].revents |= p[i].events & (SK_POLLOUT | SK_POLLWRNORM);
         if (p[i].revents) ready++;
     }
     return ready;
+}
+static void apply_host_pfd_revents(sk_pollfd *p, struct pollfd *host_pfd, const int *host_pfd_map, const int *host_efd_map, int n_host, int *ready) {
+    for (int j = 0; j < n_host; j++) {
+        int idx = host_pfd_map[j];
+        int fd = host_efd_map[j];
+        short orig = p[idx].revents;
+        if (host_pfd[j].revents & POLLIN) p[idx].revents |= p[idx].events & (SK_POLLIN | SK_POLLRDNORM);
+        if (host_pfd[j].revents & POLLOUT) {
+            dm_host_mutex_lock(&g_efd_m);
+            if (sk_used(fd) && !g_efd[fd].connected && g_efd[fd].used == SK_TCP) {
+                int sock_err = 0;
+                socklen_t elen = sizeof(sock_err);
+                getsockopt(host_pfd[j].fd, SOL_SOCKET, SO_ERROR, &sock_err, &elen);
+                if (sock_err == 0) {
+                    g_efd[fd].connected = 1;
+                    p[idx].revents |= p[idx].events & (SK_POLLOUT | SK_POLLWRNORM);
+                } else {
+                    g_efd[fd].connected = 0;
+                    g_efd[fd].so_error = host_errno_to_switch(sock_err);
+                    p[idx].revents |= SK_POLLERR | SK_POLLHUP;
+                }
+            } else {
+                p[idx].revents |= p[idx].events & (SK_POLLOUT | SK_POLLWRNORM);
+            }
+            pthread_mutex_unlock(&g_efd_m);
+        }
+        if (host_pfd[j].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            if (host_pfd[j].revents & POLLERR) p[idx].revents |= SK_POLLERR;
+            if (host_pfd[j].revents & POLLHUP) p[idx].revents |= SK_POLLHUP;
+            if (host_pfd[j].revents & POLLNVAL) p[idx].revents |= SK_POLLNVAL;
+        }
+        if (p[idx].revents && !orig) (*ready)++;
+    }
 }
 int dm_sk_poll(void *fds, uint64_t n, int ms) {
     sk_pollfd *p = fds; uint64_t open = 0, generation[EFD_MAX] = {0};
@@ -489,7 +635,7 @@ int dm_sk_poll(void *fds, uint64_t n, int ms) {
     for (uint64_t i = 0; i < n; i++) p[i].revents = 0;
     if (!open) { pthread_mutex_unlock(&g_efd_m); return sk_idle(ms); }
 
-    int64_t limit_ms = (ms < 0 ? 100 : (int64_t)ms);
+    int64_t limit_ms = (int64_t)ms;
     uint64_t start = guest_ns();
     int ready = 0;
 
@@ -499,6 +645,7 @@ int dm_sk_poll(void *fds, uint64_t n, int ms) {
         // Also check any host descriptors
         struct pollfd host_pfd[EFD_MAX];
         int host_pfd_map[EFD_MAX];
+        int host_efd_map[EFD_MAX];
         int n_host = 0;
         for (uint64_t i = 0; i < n; i++) {
             int fd = p[i].fd;
@@ -510,6 +657,7 @@ int dm_sk_poll(void *fds, uint64_t n, int ms) {
                 host_pfd[n_host].events = events;
                 host_pfd[n_host].revents = 0;
                 host_pfd_map[n_host] = (int)i;
+                host_efd_map[n_host] = fd;
                 n_host++;
             }
         }
@@ -518,28 +666,27 @@ int dm_sk_poll(void *fds, uint64_t n, int ms) {
         if (n_host > 0) {
             int hr = poll(host_pfd, n_host, 0);
             if (hr > 0) {
-                for (int j = 0; j < n_host; j++) {
-                    int idx = host_pfd_map[j];
-                    short orig = p[idx].revents;
-                    if (host_pfd[j].revents & POLLIN) p[idx].revents |= p[idx].events & (SK_POLLIN | SK_POLLRDNORM);
-                    if (host_pfd[j].revents & POLLOUT) p[idx].revents |= p[idx].events & (SK_POLLOUT | SK_POLLWRNORM);
-                    if (host_pfd[j].revents & (POLLERR | POLLHUP | POLLNVAL)) p[idx].revents |= host_pfd[j].revents;
-                    if (p[idx].revents && !orig) ready++;
-                }
+                apply_host_pfd_revents(p, host_pfd, host_pfd_map, host_efd_map, n_host, &ready);
             }
         }
 
         if (ready || ms == 0) return ready;
 
         int64_t elapsed_ms = (int64_t)(guest_ns() - start) / 1000000;
-        if (elapsed_ms >= limit_ms) return 0;
+        if (limit_ms >= 0 && elapsed_ms >= limit_ms) return 0;
 
-        int slice_ms = 5;
-        if (limit_ms - elapsed_ms < slice_ms) slice_ms = (int)(limit_ms - elapsed_ms);
-        if (slice_ms <= 0) slice_ms = 1;
+        int slice_ms = 10;
+        if (limit_ms >= 0) {
+            if (limit_ms - elapsed_ms < slice_ms) slice_ms = (int)(limit_ms - elapsed_ms);
+            if (slice_ms <= 0) slice_ms = 1;
+        }
 
         if (n_host > 0) {
-            poll(host_pfd, n_host, slice_ms);
+            int pr = poll(host_pfd, n_host, slice_ms);
+            if (pr > 0) {
+                apply_host_pfd_revents(p, host_pfd, host_pfd_map, host_efd_map, n_host, &ready);
+                if (ready) return ready;
+            }
             dm_host_mutex_lock(&g_efd_m);
         } else {
             dm_host_mutex_lock(&g_efd_m);
@@ -607,7 +754,7 @@ int dm_sk_accept(int s, void *a, unsigned *n) {
                 pthread_mutex_unlock(&g_efd_m);
                 return fd;
             }
-            return sk_error(errno);
+            return sk_error(host_errno_to_switch(errno));
         }
     }
     return sk_fail();
@@ -617,11 +764,11 @@ SKF("_ZN2nn6socket6ListenEii", h_sk_Listen, int s, int n) { return dm_sk_listen(
 SKF("_ZN2nn6socket6AcceptEiPNS0_8SockAddrEPj", h_sk_Accept, int s, void *a, unsigned *n) { return dm_sk_accept(s, a, n); }
 SKF("_ZN2nn6socket5CloseEi", h_sk_Close, int s) { return dm_sk_close(s); }
 SKF("_ZN2nn6socket11GetPeerNameEiPNS0_8SockAddrEPj", h_sk_GetPeerName, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 1); }
+SKF("_ZN2nn6socket11GetPeerNameEiP8sockaddrPj", h_sk_GetPeerName21, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 1); }
 SKF("_ZN2nn6socket11GetSockNameEiPNS0_8SockAddrEPj", h_sk_GetSockName, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 0); }
 SKF("_ZN2nn6socket10GetSockOptEiNS0_5LevelENS0_6OptionEPvPj", h_sk_GetSockOpt, int s, int l, int o, void *v, unsigned *n) { return dm_sk_getopt(s, l, o, v, n); }
 SKF("_ZN2nn6socket10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj", h_sk_SetSockOpt, int s, int l, int o, const void *v, unsigned n) { return dm_sk_setopt(s, l, o, v, n); }
 SKF("_ZN2nn6socket5FcntlEiNS0_12FcntlCommandEz", h_sk_Fcntl, int s, int c, int v) { return dm_sk_fcntl(s, c, v); }
-SKF("_ZN2nn6socket11GetPeerNameEiP8sockaddrPj", h_sk_GetPeerName21, int s, void *a, unsigned *n) { return dm_sk_name(s, a, n, 1); }
 SKF("_ZN2nn6socket8ShutdownEiNS0_14ShutdownMethodE", h_sk_Shutdown21, int s, int how) { return dm_sk_shutdown(s, how); }
 HLE_FORCE("_ZN2nn6socket4ReadEiPvm", "BSD read", long, h_sk_Read, int s, void *b, unsigned long n) { return dm_sk_read(s, b, n); }
 HLE_FORCE("_ZN2nn6socket5WriteEiPKvm", "BSD write", long, h_sk_Write, int s, const void *b, unsigned long n) { return dm_sk_write(s, b, n); }
@@ -637,6 +784,16 @@ HLE_FORCE("_ZN2nn6socket4RecvEiPvmNS0_7MsgFlagE", "BSD recv", long, h_sk_Recv, i
 HLE_FORCE("_ZN2nn6socket8RecvFromEiPvmNS0_7MsgFlagEPNS0_8SockAddrEPj", "BSD recvfrom", long, h_sk_RecvFrom, int s, void *b, unsigned long n, int f, void *a, unsigned *al) { return dm_sk_recvfrom(s, b, n, f, a, al); }
 HLE_FORCE("_ZN2nn6socket4SendEiPKvmNS0_7MsgFlagE", "BSD send", long, h_sk_Send, int s, const void *b, unsigned long n, int f) { return dm_sk_sendto(s, b, n, f, NULL, 0); }
 HLE_FORCE("_ZN2nn6socket12GetLastErrorEv", "socket error code kept by the host", int, h_sk_GetLastError, void) { return t_skerr; }
+HLE_FORCE("_ZN2nn6socket9InetHtonlEj", "htonl", uint32_t, h_sk_Htonl, uint32_t v) { return htonl(v); }
+HLE_FORCE("_ZN2nn6socket9InetHtonsEt", "htons", uint16_t, h_sk_Htons, uint16_t v) { return htons(v); }
+HLE_FORCE("_ZN2nn6socket9InetNtohlEj", "ntohl", uint32_t, h_sk_Ntohl, uint32_t v) { return ntohl(v); }
+HLE_FORCE("_ZN2nn6socket9InetNtohsEt", "ntohs", uint16_t, h_sk_Ntohs, uint16_t v) { return ntohs(v); }
+HLE_FORCE("nnsocketInetHtons", "htons C", uint16_t, h_nsk_Htons, uint16_t v) { return htons(v); }
+HLE_FORCE("nnsocketInetNtohs", "ntohs C", uint16_t, h_nsk_Ntohs, uint16_t v) { return ntohs(v); }
+HLE_FORCE("_ZN2nn6socket8InetAtonEPKcP7in_addr", "inet_aton", int, h_sk_Aton, const char *cp, struct in_addr *pin) { return inet_aton(cp, pin); }
+HLE_FORCE("_ZN2nn6socket8InetNtoaE7in_addr", "inet_ntoa", char *, h_sk_Ntoa, struct in_addr in) { return inet_ntoa(in); }
+HLE_FORCE("_ZN2nn6socket8InetNtopEiPKvPcj", "inet_ntop", const char *, h_sk_Ntop, int af, const void *src, char *dst, unsigned size) { return inet_ntop(af, src, dst, size); }
+HLE_FORCE("_ZN2nn6socket8InetPtonEiPKcPv", "inet_pton", int, h_sk_Pton, int af, const char *src, void *dst) { return inet_pton(af, src, dst); }
 HLE_FORCE("_ZN2nn6socket12SetAllocatorEPNS_14MemoryResourceE", "socket library allocator", void, h_sk_SetAlloc, void *r) { (void)r; }
 
 // DNS Resolution
@@ -645,15 +802,34 @@ int dm_sk_getaddrinfo(const char *h, const char *s, const void *hint, void **res
     *res = NULL;
     if (!nextendo_enabled()) return 4;
 
+    const char *clean_h = h;
+    if (clean_h) {
+        if (strncmp(clean_h, "http://", 7) == 0) clean_h += 7;
+        else if (strncmp(clean_h, "https://", 8) == 0) clean_h += 8;
+        else if (strncmp(clean_h, "ws://", 5) == 0) clean_h += 5;
+        else if (strncmp(clean_h, "wss://", 6) == 0) clean_h += 6;
+    }
+
     char redir_ip[64] = {0};
     char redir_canon[256] = {0};
     int redirected = 0;
-    if (h) {
-        redirected = nextendo_redirect_host(h, redir_ip, sizeof(redir_ip), redir_canon, sizeof(redir_canon));
+    if (clean_h && clean_h[0] != '\0') {
+        redirected = nextendo_redirect_host(clean_h, redir_ip, sizeof(redir_ip), redir_canon, sizeof(redir_canon));
     }
 
-    const char *target_ip = redirected ? redir_ip : h;
-    if (!target_ip) return 4;
+    const char *target_ip = NULL;
+    if (redirected) {
+        target_ip = redir_ip;
+    } else if (clean_h && clean_h[0] != '\0') {
+        target_ip = clean_h;
+    } else {
+        const struct addrinfo *hin = (const struct addrinfo *)hint;
+        if (hin && (hin->ai_flags & AI_PASSIVE)) {
+            target_ip = "0.0.0.0";
+        } else {
+            target_ip = "127.0.0.1";
+        }
+    }
 
     int port = s ? atoi(s) : 0;
     if (port > 0 && redirected) {
@@ -675,27 +851,31 @@ int dm_sk_getaddrinfo(const char *h, const char *s, const void *hint, void **res
     ai->ai_addrlen = sizeof(struct sockaddr_in);
     ai->ai_addr = (struct sockaddr *)sa;
 
+    sa->sin_len = sizeof(struct sockaddr_in);
     sa->sin_family = AF_INET;
     sa->sin_port = htons((uint16_t)port);
     in_addr_t inaddr = inet_addr(target_ip);
-    if (inaddr == INADDR_NONE) {
+    if (inaddr == INADDR_NONE && strcmp(target_ip, "255.255.255.255") != 0) {
         struct hostent *he = gethostbyname(target_ip);
         if (he && he->h_addr_list && he->h_addr_list[0]) {
             memcpy(&sa->sin_addr, he->h_addr_list[0], sizeof(sa->sin_addr));
         } else {
             free(buf);
+            LOG("[DNS] dm_sk_getaddrinfo failed resolving target_ip '%s'", target_ip);
             return 4;
         }
     } else {
         sa->sin_addr.s_addr = inaddr;
     }
 
-    const char *canon_str = redir_canon[0] ? redir_canon : (h ? h : target_ip);
+    const char *canon_str = redir_canon[0] ? redir_canon : (h && h[0] ? h : target_ip);
     strncpy(canon, canon_str, 255);
     ai->ai_canonname = canon;
     ai->ai_next = NULL;
 
     *res = ai;
+    LOG("[DNS] dm_sk_getaddrinfo host='%s' port='%s' -> target_ip='%s' (redirected=%d)",
+        h ? h : "(null)", s ? s : "(null)", target_ip, redirected);
     return 0;
 }
 
@@ -703,18 +883,44 @@ void dm_sk_freeaddrinfo(void *ai) {
     if (ai) free(ai);
 }
 
-HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_", "name resolution", int, h_sk_GetAddrInfo, const char *h, const char *s, const void *hint, void **res) {
+HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_", "name resolution (AddrInfo)", int, h_sk_GetAddrInfo, const char *h, const char *s, const void *hint, void **res) {
     return dm_sk_getaddrinfo(h, s, hint, res);
 }
-HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEPNS0_8AddrInfoE", "pairs with GetAddrInfo", void, h_sk_FreeAddrInfo, void *ai) {
+HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PK8addrinfoPPS3_PKNS0_14ResolverOptionEm", "name resolution with resolver option", int, h_sk_GetAddrInfoOpt, const char *h, const char *s, const void *hint, void **res, const void *o, unsigned long n) {
+    (void)o; (void)n; return dm_sk_getaddrinfo(h, s, hint, res);
+}
+HLE_FORCE("_ZN2nn6socket6detail11GetAddrInfoEPKcS3_PK8addrinfoPPS4_PKNS0_14ResolverOptionEm", "name resolution detail", int, h_sk_GetAddrInfoDetail, const char *h, const char *s, const void *hint, void **res, const void *o, unsigned long n) {
+    (void)o; (void)n; return dm_sk_getaddrinfo(h, s, hint, res);
+}
+HLE_FORCE("_ZN2nn6socket8resolver11GetAddrInfoEPKcS3_PK8addrinfoPPS4_", "name resolution resolver", int, h_sk_GetAddrInfoRes, const char *h, const char *s, const void *hint, void **res) {
+    return dm_sk_getaddrinfo(h, s, hint, res);
+}
+HLE_FORCE("_ZN2nn6socket8resolver11GetAddrInfoEPKcS3_PK8addrinfoPPS4_PKNS0_14ResolverOptionEm", "name resolution resolver opt", int, h_sk_GetAddrInfoResOpt, const char *h, const char *s, const void *hint, void **res, const void *o, unsigned long n) {
+    (void)o; (void)n; return dm_sk_getaddrinfo(h, s, hint, res);
+}
+
+HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEPNS0_8AddrInfoE", "pairs with GetAddrInfo (AddrInfo)", void, h_sk_FreeAddrInfo, void *ai) {
+    dm_sk_freeaddrinfo(ai);
+}
+HLE_FORCE("_ZN2nn6socket6detail12FreeAddrInfoEP8addrinfo", "pairs with GetAddrInfo detail", void, h_sk_FreeAddrInfo_detail, void *ai) {
     dm_sk_freeaddrinfo(ai);
 }
 
 static void *resolve_hostent(const char *n) {
-    if (!n || !nextendo_enabled()) { t_skerr = SK_ENETDOWN; return NULL; }
+    if (!nextendo_enabled()) { t_skerr = SK_ENETDOWN; return NULL; }
+    const char *clean_n = n;
+    if (clean_n) {
+        if (strncmp(clean_n, "http://", 7) == 0) clean_n += 7;
+        else if (strncmp(clean_n, "https://", 8) == 0) clean_n += 8;
+        else if (strncmp(clean_n, "ws://", 5) == 0) clean_n += 5;
+        else if (strncmp(clean_n, "wss://", 6) == 0) clean_n += 6;
+    }
     char redir_ip[64] = {0};
     char redir_canon[256] = {0};
-    int redirected = nextendo_redirect_host(n, redir_ip, sizeof(redir_ip), redir_canon, sizeof(redir_canon));
+    int redirected = 0;
+    if (clean_n && clean_n[0] != '\0') {
+        redirected = nextendo_redirect_host(clean_n, redir_ip, sizeof(redir_ip), redir_canon, sizeof(redir_canon));
+    }
 
     static __thread struct hostent t_he;
     static __thread char *t_aliases[1];
@@ -727,24 +933,96 @@ static void *resolve_hostent(const char *n) {
         t_addrs[0] = (char *)&t_ip;
         t_addrs[1] = NULL;
         t_aliases[0] = NULL;
-        strncpy(t_name, redir_canon[0] ? redir_canon : n, sizeof(t_name) - 1);
+        strncpy(t_name, redir_canon[0] ? redir_canon : (clean_n ? clean_n : ""), sizeof(t_name) - 1);
         t_he.h_name = t_name;
         t_he.h_aliases = t_aliases;
         t_he.h_addrtype = AF_INET;
         t_he.h_length = 4;
         t_he.h_addr_list = t_addrs;
+        LOG("[DNS] resolve_hostent host='%s' -> redirected='%s'", n ? n : "(null)", redir_ip);
         return &t_he;
     }
 
-    struct hostent *sys_he = gethostbyname(n);
-    if (!sys_he) { t_skerr = 1; return NULL; }
+    if (!clean_n || clean_n[0] == '\0') {
+        t_ip = htonl(INADDR_LOOPBACK);
+        t_addrs[0] = (char *)&t_ip;
+        t_addrs[1] = NULL;
+        t_aliases[0] = NULL;
+        strncpy(t_name, "localhost", sizeof(t_name) - 1);
+        t_he.h_name = t_name;
+        t_he.h_aliases = t_aliases;
+        t_he.h_addrtype = AF_INET;
+        t_he.h_length = 4;
+        t_he.h_addr_list = t_addrs;
+        LOG("[DNS] resolve_hostent host='%s' -> localhost", n ? n : "(null)");
+        return &t_he;
+    }
+
+    struct hostent *sys_he = gethostbyname(clean_n);
+    if (!sys_he) {
+        t_skerr = 1;
+        LOG("[DNS] resolve_hostent host='%s' -> sys resolution failed", n);
+        return NULL;
+    }
+    LOG("[DNS] resolve_hostent host='%s' -> sys resolved", n);
     return sys_he;
 }
-HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKcPKNS0_14ResolverOptionEm", "name resolution", void *, h_sk_GetHostEnt, const char *n, const void *o, unsigned long c) {
+HLE_FORCE("_ZN2nn6socket13GetHostByNameEPKc", "name resolution", void *, h_sk_GetHostByName, const char *n) {
+    return resolve_hostent(n);
+}
+HLE_FORCE("_ZN2nn6socket13GetHostByNameEPKcPKNS0_14ResolverOptionEm", "name resolution with options", void *, h_sk_GetHostByNameOpt, const char *n, const void *o, unsigned long c) {
     (void)o; (void)c; return resolve_hostent(n);
 }
-HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKc", "name resolution", void *, h_sk_GetHostEnt21, const char *n) {
+HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKcPKNS0_14ResolverOptionEm", "name resolution legacy", void *, h_sk_GetHostEnt, const char *n, const void *o, unsigned long c) {
+    (void)o; (void)c; return resolve_hostent(n);
+}
+HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKc", "name resolution legacy", void *, h_sk_GetHostEnt21, const char *n) {
     return resolve_hostent(n);
+}
+HLE_FORCE("nnsocketGetHostByName", "name resolution (C API)", void *, h_nsk_GetHostByName, const char *n) {
+    return resolve_hostent(n);
+}
+HLE_FORCE("_ZN2nn6socket6detail13GetHostByNameEPKcPKNS0_14ResolverOptionEm", "name resolution detail", void *, h_sk_GetHostByNameDetail, const char *n, const void *o, unsigned long c) {
+    (void)o; (void)c; return resolve_hostent(n);
+}
+HLE_FORCE("_ZN2nn6socket8resolver13GetHostByNameEPKc", "name resolution resolver", void *, h_sk_GetHostByNameRes, const char *n) {
+    return resolve_hostent(n);
+}
+HLE_FORCE("_ZN2nn6socket8resolver13GetHostByNameEPKcPKNS0_14ResolverOptionEm", "name resolution resolver opt", void *, h_sk_GetHostByNameResOpt, const char *n, const void *o, unsigned long c) {
+    (void)o; (void)c; return resolve_hostent(n);
+}
+
+static _Atomic int g_next_cancel_handle = 1;
+HLE_FORCE("nnsocketRequestCancelHandle", "request cancel handle (C API)", int, h_nsk_ReqCancel, void) {
+    int h = atomic_fetch_add(&g_next_cancel_handle, 1);
+    LOG("[DNS] RequestCancelHandle (C API) -> %d", h);
+    return h;
+}
+HLE_FORCE("_ZN2nn6socket19RequestCancelHandleEv", "request cancel handle", int, h_sk_ReqCancel, void) {
+    int h = atomic_fetch_add(&g_next_cancel_handle, 1);
+    LOG("[DNS] RequestCancelHandle -> %d", h);
+    return h;
+}
+HLE_FORCE("_ZN2nn6socket6detail19RequestCancelHandleEv", "request cancel handle detail", int, h_sk_ReqCancelDetail, void) {
+    int h = atomic_fetch_add(&g_next_cancel_handle, 1);
+    return h;
+}
+HLE_FORCE("_ZN2nn6socket8resolver19RequestCancelHandleEv", "request cancel handle resolver", int, h_sk_ReqCancelRes, void) {
+    int h = atomic_fetch_add(&g_next_cancel_handle, 1);
+    return h;
+}
+
+HLE_FORCE("nnsocketCancel", "cancel socket call (C API)", int, h_nsk_Cancel, int h) {
+    (void)h; return 0;
+}
+HLE_FORCE("_ZN2nn6socket6CancelEi", "cancel socket call", int, h_sk_Cancel, int h) {
+    (void)h; return 0;
+}
+HLE_FORCE("_ZN2nn6socket6detail6CancelEi", "cancel socket call detail", int, h_sk_CancelDetail, int h) {
+    (void)h; return 0;
+}
+HLE_FORCE("_ZN2nn6socket8resolver16CancelSocketCallEi", "cancel socket call resolver", int, h_sk_CancelRes, int h) {
+    (void)h; return 0;
 }
 
 // C interface
@@ -799,18 +1077,21 @@ typedef struct {
 static dm_ssl_conn_t g_ssl_conns[SSL_CONN_MAX];
 static pthread_mutex_t g_ssl_m = PTHREAD_MUTEX_INITIALIZER;
 
-static dm_ssl_conn_t *ssl_find_conn_by_self(void *self) {
-    if (!self) return NULL;
-    for (int i = 0; i < SSL_CONN_MAX; i++) {
-        if (g_ssl_conns[i].in_use && g_ssl_conns[i].guest_self == self) return &g_ssl_conns[i];
-    }
-    return NULL;
-}
-
 static dm_ssl_conn_t *ssl_find_conn_by_id(uint32_t id) {
     if (!id) return NULL;
     for (int i = 0; i < SSL_CONN_MAX; i++) {
         if (g_ssl_conns[i].in_use && g_ssl_conns[i].conn_id == id) return &g_ssl_conns[i];
+    }
+    return NULL;
+}
+
+static dm_ssl_conn_t *ssl_find_conn_by_self(void *self) {
+    if (!self) return NULL;
+    if ((uintptr_t)self < 1000) return ssl_find_conn_by_id((uint32_t)(uintptr_t)self);
+    for (int i = 0; i < SSL_CONN_MAX; i++) {
+        if (!g_ssl_conns[i].in_use) continue;
+        if (g_ssl_conns[i].guest_self == self || &g_ssl_conns[i] == (dm_ssl_conn_t *)self)
+            return &g_ssl_conns[i];
     }
     return NULL;
 }
@@ -821,7 +1102,7 @@ static dm_ssl_conn_t *ssl_alloc_conn(void *self, uint32_t *out_id) {
         if (!g_ssl_conns[i].in_use) {
             memset(&g_ssl_conns[i], 0, sizeof(dm_ssl_conn_t));
             g_ssl_conns[i].in_use = 1;
-            g_ssl_conns[i].guest_self = self;
+            g_ssl_conns[i].guest_self = self ? self : (void *)&g_ssl_conns[i];
             g_ssl_conns[i].conn_id = s_next_id++;
             g_ssl_conns[i].guest_fd = -1;
             g_ssl_conns[i].real_fd = -1;
@@ -932,20 +1213,13 @@ SSF("_ZN2nn3ssl10Connection18GetVerifyCertErrorEPNS_6ResultE", h_ssl_CnVerifyErr
     (void)self; if (r) *r = 0; return RES_OK;
 }
 
-SSF("_ZN2nn3ssl10Connection11DoHandshakeEv", h_ssl_CnHandshake, void *self) {
-    if (!nextendo_enabled()) return RES_FAIL;
-    dm_host_mutex_lock(&g_ssl_m);
-    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
-    if (!c || c->real_fd < 0) {
-        pthread_mutex_unlock(&g_ssl_m);
-        return RES_FAIL;
-    }
+static Result ssl_do_handshake_internal(dm_ssl_conn_t *c) {
+    if (!c || c->real_fd < 0) return RES_FAIL;
+    if (c->handshake_done) return RES_OK;
+
     if (!c->ssl_ctx) {
         c->ssl_ctx = SSLCreateContext(NULL, kSSLClientSide, kSSLStreamType);
-        if (!c->ssl_ctx) {
-            pthread_mutex_unlock(&g_ssl_m);
-            return RES_FAIL;
-        }
+        if (!c->ssl_ctx) return RES_FAIL;
         SSLSetIOFuncs(c->ssl_ctx, ssl_read_cb, ssl_write_cb);
         SSLSetConnection(c->ssl_ctx, (SSLConnectionRef)(intptr_t)c->real_fd);
 
@@ -974,21 +1248,21 @@ SSF("_ZN2nn3ssl10Connection11DoHandshakeEv", h_ssl_CnHandshake, void *self) {
             SSLSetALPNProtocols(c->ssl_ctx, arr);
             CFRelease(arr);
         }
+        LOG("[SSL] Context initialized for fd=%d, sni=%s", c->real_fd, sni ? sni : "(null)");
     }
+
     SSLContextRef ctx = c->ssl_ctx;
     int real_fd = c->real_fd;
-    pthread_mutex_unlock(&g_ssl_m);
 
-    OSStatus st;
-    for (;;) {
-        st = SSLHandshake(ctx);
+    // Handshake loop: poll for up to 3000ms if would block
+    for (int attempts = 0; attempts < 300; attempts++) {
+        OSStatus st = SSLHandshake(ctx);
         if (st == errSSLServerAuthCompleted) {
             st = SSLHandshake(ctx);
         }
         if (st == noErr) {
-            dm_host_mutex_lock(&g_ssl_m);
             c->handshake_done = 1;
-            pthread_mutex_unlock(&g_ssl_m);
+            LOG("[SSL] Handshake SUCCESS for fd=%d", real_fd);
             return RES_OK;
         }
         if (st == errSSLWouldBlock) {
@@ -996,55 +1270,88 @@ SSF("_ZN2nn3ssl10Connection11DoHandshakeEv", h_ssl_CnHandshake, void *self) {
             poll(&pfd, 1, 10);
             continue;
         }
-        break;
+        c->last_error = (uint32_t)st;
+        LOG("[SSL] Handshake FAILED with OSStatus=%d for fd=%d", (int)st, real_fd);
+        return RES_FAIL;
     }
+    LOG("[SSL] Handshake TIMEOUT for fd=%d", real_fd);
+    return 0x1987b; // nn::ssl::ResultWouldBlock -> CURLE_AGAIN
+}
+
+static int ssl_read_internal(dm_ssl_conn_t *c, void *buf, unsigned n, uint32_t *out_result) {
+    if (!c || !c->ssl_ctx || !c->handshake_done) {
+        if (out_result) *out_result = RES_FAIL;
+        return -1;
+    }
+    size_t processed = 0;
+    OSStatus st = SSLRead(c->ssl_ctx, buf, n, &processed);
+    if (processed > 0) {
+        if (out_result) *out_result = RES_OK;
+        LOG("[SSL] Read -> %zu bytes", processed);
+        return (int)processed;
+    }
+    if (st == errSSLClosedGraceful) {
+        if (out_result) *out_result = RES_OK;
+        LOG("[SSL] Read -> EOF (closed graceful)");
+        return 0;
+    }
+    if (st == errSSLWouldBlock) {
+        t_skerr = SK_EAGAIN;
+        if (out_result) *out_result = 0x1987b; // nn::ssl::ResultWouldBlock -> CURLE_AGAIN
+        return -1;
+    }
+    LOG("[SSL] Read FAILED st=%d", (int)st);
+    if (out_result) *out_result = RES_FAIL;
+    return -1;
+}
+
+static int ssl_write_internal(dm_ssl_conn_t *c, const void *buf, unsigned n, uint32_t *out_result) {
+    if (!c || !c->ssl_ctx || !c->handshake_done) {
+        if (out_result) *out_result = RES_FAIL;
+        return -1;
+    }
+    size_t written = 0;
+    OSStatus st = SSLWrite(c->ssl_ctx, buf, n, &written);
+    if (written > 0) {
+        if (out_result) *out_result = RES_OK;
+        LOG("[SSL] Write -> %zu bytes", written);
+        return (int)written;
+    }
+    if (st == errSSLWouldBlock) {
+        t_skerr = SK_EAGAIN;
+        if (out_result) *out_result = 0x1987b; // nn::ssl::ResultWouldBlock -> CURLE_AGAIN
+        return -1;
+    }
+    LOG("[SSL] Write FAILED st=%d", (int)st);
+    if (out_result) *out_result = RES_FAIL;
+    return -1;
+}
+
+SSF("_ZN2nn3ssl10Connection11DoHandshakeEv", h_ssl_CnHandshake, void *self) {
+    if (!nextendo_enabled()) return RES_FAIL;
     dm_host_mutex_lock(&g_ssl_m);
-    c->last_error = (uint32_t)st;
+    dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
+    Result r = ssl_do_handshake_internal(c);
     pthread_mutex_unlock(&g_ssl_m);
-    return RES_FAIL;
+    return r;
 }
 
 HLE_FORCE("_ZN2nn3ssl10Connection4ReadEPcj", "ssl connection read", int, h_ssl_CnRead, void *self, char *b, unsigned n) {
     if (!nextendo_enabled() || !self || !b || !n) return -1;
     dm_host_mutex_lock(&g_ssl_m);
     dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
-    if (!c || !c->ssl_ctx || !c->handshake_done) {
-        pthread_mutex_unlock(&g_ssl_m);
-        return -1;
-    }
-    SSLContextRef ctx = c->ssl_ctx;
+    int r = ssl_read_internal(c, b, n, NULL);
     pthread_mutex_unlock(&g_ssl_m);
-
-    size_t processed = 0;
-    OSStatus st = SSLRead(ctx, b, n, &processed);
-    if (processed > 0) return (int)processed;
-    if (st == errSSLClosedGraceful) return 0;
-    if (st == errSSLWouldBlock) {
-        t_skerr = SK_EAGAIN;
-        return -1;
-    }
-    return -1;
+    return r;
 }
 
 HLE_FORCE("_ZN2nn3ssl10Connection5WriteEPKcj", "ssl connection write", int, h_ssl_CnWrite, void *self, const char *b, unsigned n) {
     if (!nextendo_enabled() || !self || !b || !n) return -1;
     dm_host_mutex_lock(&g_ssl_m);
     dm_ssl_conn_t *c = ssl_find_conn_by_self(self);
-    if (!c || !c->ssl_ctx || !c->handshake_done) {
-        pthread_mutex_unlock(&g_ssl_m);
-        return -1;
-    }
-    SSLContextRef ctx = c->ssl_ctx;
+    int r = ssl_write_internal(c, b, n, NULL);
     pthread_mutex_unlock(&g_ssl_m);
-
-    size_t written = 0;
-    OSStatus st = SSLWrite(ctx, b, n, &written);
-    if (written > 0) return (int)written;
-    if (st == errSSLWouldBlock) {
-        t_skerr = SK_EAGAIN;
-        return -1;
-    }
-    return -1;
+    return r;
 }
 
 SSF("_ZN2nn3ssl10Connection4PeekEPcPij", h_ssl_CnPeek, void *self, char *b, int *o, unsigned n) {
@@ -1075,12 +1382,18 @@ SSF("_ZN2nn3ssl10Connection4PollEPNS1_9PollEventES3_j", h_ssl_CnPoll, void *self
 }
 
 // C ssl interface
+HLE_FORCE("nnsslContextCreate", "ssl context create", Result, h_nssl_CtxCreate, uint32_t *out_id, uint32_t ver) {
+    (void)ver;
+    if (out_id) *out_id = 1;
+    return RES_OK;
+}
 HLE_FORCE("nnsslConnectionCreate", "ssl connection create", Result, h_nssl_Create, uint32_t *out_id, uint32_t ctx_id) {
     (void)ctx_id;
     if (!nextendo_enabled()) return RES_FAIL;
     dm_host_mutex_lock(&g_ssl_m);
     dm_ssl_conn_t *c = ssl_alloc_conn(NULL, out_id);
     pthread_mutex_unlock(&g_ssl_m);
+    LOG("[SSL] nnsslConnectionCreate -> id=%u", out_id ? *out_id : 0);
     return c ? RES_OK : RES_FAIL;
 }
 HLE_FORCE("nnsslConnectionDestroy", "ssl connection destroy", Result, h_nssl_Destroy, uint32_t id) {
@@ -1088,6 +1401,7 @@ HLE_FORCE("nnsslConnectionDestroy", "ssl connection destroy", Result, h_nssl_Des
     dm_host_mutex_lock(&g_ssl_m);
     ssl_free_conn(ssl_find_conn_by_id(id));
     pthread_mutex_unlock(&g_ssl_m);
+    LOG("[SSL] nnsslConnectionDestroy(id=%u)", id);
     return RES_OK;
 }
 HLE_FORCE("nnsslConnectionSetSocketDescriptor", "ssl set socket", Result, h_nssl_SetSock, uint32_t id, int s) {
@@ -1099,6 +1413,7 @@ HLE_FORCE("nnsslConnectionSetSocketDescriptor", "ssl set socket", Result, h_nssl
         c->real_fd = (s >= 0 && s < EFD_MAX) ? g_efd[s].real_fd : -1;
     }
     pthread_mutex_unlock(&g_ssl_m);
+    LOG("[SSL] nnsslConnectionSetSocketDescriptor(id=%u, guest_fd=%d, real_fd=%d)", id, s, c ? c->real_fd : -1);
     return c ? RES_OK : RES_FAIL;
 }
 HLE_FORCE("nnsslConnectionSetHostName", "ssl set host name", Result, h_nssl_SetHost, uint32_t id, const char *h, uint32_t n) {
@@ -1111,6 +1426,7 @@ HLE_FORCE("nnsslConnectionSetHostName", "ssl set host name", Result, h_nssl_SetH
         c->hostname[len] = '\0';
     }
     pthread_mutex_unlock(&g_ssl_m);
+    LOG("[SSL] nnsslConnectionSetHostName(id=%u, host=%.*s)", id, (int)n, h ? h : "");
     return c ? RES_OK : RES_FAIL;
 }
 HLE_FORCE("nnsslConnectionDoHandshakeWithCertBuffer", "ssl handshake", Result, h_nssl_Handshake, uint32_t id, void *buf, uint32_t sz) {
@@ -1118,35 +1434,77 @@ HLE_FORCE("nnsslConnectionDoHandshakeWithCertBuffer", "ssl handshake", Result, h
     if (!nextendo_enabled()) return RES_FAIL;
     dm_host_mutex_lock(&g_ssl_m);
     dm_ssl_conn_t *c = ssl_find_conn_by_id(id);
+    Result r = ssl_do_handshake_internal(c);
     pthread_mutex_unlock(&g_ssl_m);
-    if (!c) return RES_FAIL;
-    return h_ssl_CnHandshake(c->guest_self ? c->guest_self : c);
+    return r;
+}
+HLE_FORCE("nnsslConnectionDoHandshake", "ssl handshake no cert", Result, h_nssl_HandshakeNoCert, uint32_t id) {
+    return h_nssl_Handshake(id, NULL, 0);
+}
+HLE_FORCE("nnsslConnectionDoHandshakeWithBuffer", "ssl handshake buf", Result, h_nssl_HandshakeBuf, uint32_t id, void *buf, uint32_t sz) {
+    return h_nssl_Handshake(id, buf, sz);
 }
 HLE_FORCE("nnsslConnectionRead", "ssl read", Result, h_nssl_Read, uint32_t id, void *buf, uint32_t sz, uint32_t *out_read) {
     if (!nextendo_enabled()) return RES_FAIL;
     dm_host_mutex_lock(&g_ssl_m);
     dm_ssl_conn_t *c = ssl_find_conn_by_id(id);
+    uint32_t res = RES_FAIL;
+    int r = ssl_read_internal(c, buf, sz, &res);
     pthread_mutex_unlock(&g_ssl_m);
-    if (!c) return RES_FAIL;
-    int r = h_ssl_CnRead(c->guest_self ? c->guest_self : c, buf, sz);
-    if (r >= 0) { if (out_read) *out_read = (uint32_t)r; return RES_OK; }
-    return RES_FAIL;
+    if (r >= 0) {
+        if (out_read) *out_read = (uint32_t)r;
+        return RES_OK;
+    }
+    return res;
 }
 HLE_FORCE("nnsslConnectionWrite", "ssl write", Result, h_nssl_Write, uint32_t id, const void *buf, uint32_t sz, uint32_t *out_written) {
     if (!nextendo_enabled()) return RES_FAIL;
     dm_host_mutex_lock(&g_ssl_m);
     dm_ssl_conn_t *c = ssl_find_conn_by_id(id);
+    uint32_t res = RES_FAIL;
+    int r = ssl_write_internal(c, buf, sz, &res);
     pthread_mutex_unlock(&g_ssl_m);
-    if (!c) return RES_FAIL;
-    int r = h_ssl_CnWrite(c->guest_self ? c->guest_self : c, buf, sz);
-    if (r >= 0) { if (out_written) *out_written = (uint32_t)r; return RES_OK; }
-    return RES_FAIL;
+    if (r >= 0) {
+        if (out_written) *out_written = (uint32_t)r;
+        return RES_OK;
+    }
+    return res;
 }
 HLE_FORCE("nnsslConnectionGetConnectionId", "ssl get id", Result, h_nssl_GetId, void *self, uint32_t *id) { (void)self; if (id) *id = 1; return RES_OK; }
 HLE_FORCE("nnsslConnectionGetNextAlpnProto", "ssl get alpn", Result, h_nssl_GetAlpn, uint32_t id, void *p, uint32_t *len) { (void)id; (void)p; if (len) *len = 0; return RES_OK; }
 HLE_FORCE("nnsslConnectionGetVerifyCertError", "ssl get verify err", Result, h_nssl_VerifyErr, uint32_t id, uint32_t *err) { (void)id; if (err) *err = 0; return RES_OK; }
-HLE_FORCE("nnsslConnectionPeek", "ssl peek", Result, h_nssl_Peek, uint32_t id, void *b, uint32_t sz, uint32_t *o) { (void)id; (void)b; (void)sz; if (o) *o = 0; return RES_OK; }
-HLE_FORCE("nnsslConnectionPending", "ssl pending", Result, h_nssl_Pending, uint32_t id, uint32_t *p) { (void)id; if (p) *p = 0; return RES_OK; }
+HLE_FORCE("nnsslConnectionPeek", "ssl peek", Result, h_nssl_Peek, uint32_t id, void *b, uint32_t sz, uint32_t *o) {
+    if (!nextendo_enabled() || !b || !sz) { if (o) *o = 0; return RES_FAIL; }
+    dm_host_mutex_lock(&g_ssl_m);
+    dm_ssl_conn_t *c = ssl_find_conn_by_id(id);
+    if (!c || !c->ssl_ctx || !c->handshake_done) {
+        pthread_mutex_unlock(&g_ssl_m);
+        if (o) *o = 0;
+        return RES_FAIL;
+    }
+    size_t buf_sz = 0;
+    SSLGetBufferedReadSize(c->ssl_ctx, &buf_sz);
+    size_t to_copy = (buf_sz < sz) ? buf_sz : sz;
+    size_t read_bytes = 0;
+    if (to_copy > 0) {
+        SSLRead(c->ssl_ctx, b, to_copy, &read_bytes);
+    }
+    pthread_mutex_unlock(&g_ssl_m);
+    if (o) *o = (uint32_t)read_bytes;
+    return RES_OK;
+}
+HLE_FORCE("nnsslConnectionPending", "ssl pending", Result, h_nssl_Pending, uint32_t id, uint32_t *p) {
+    if (!nextendo_enabled()) { if (p) *p = 0; return RES_FAIL; }
+    dm_host_mutex_lock(&g_ssl_m);
+    dm_ssl_conn_t *c = ssl_find_conn_by_id(id);
+    size_t buf_sz = 0;
+    if (c && c->ssl_ctx) {
+        SSLGetBufferedReadSize(c->ssl_ctx, &buf_sz);
+    }
+    pthread_mutex_unlock(&g_ssl_m);
+    if (p) *p = (uint32_t)buf_sz;
+    return RES_OK;
+}
 HLE_FORCE("nnsslConnectionSetIoMode", "ssl set io mode", Result, h_nssl_SetIo, uint32_t id, uint32_t m) { (void)id; (void)m; return RES_OK; }
 HLE_FORCE("nnsslConnectionSetNextAlpnProto", "ssl set alpn", Result, h_nssl_SetAlpn, uint32_t id, const void *p, uint32_t len) { (void)id; (void)p; (void)len; return RES_OK; }
 HLE_FORCE("nnsslConnectionSetOption", "ssl set opt", Result, h_nssl_SetOpt, uint32_t id, uint32_t opt, uint32_t val) { (void)id; (void)opt; (void)val; return RES_OK; }
@@ -1154,3 +1512,64 @@ HLE_FORCE("nnsslConnectionSetSessionCacheMode", "ssl set cache", Result, h_nssl_
 HLE_FORCE("nnsslConnectionSetVerifyOption", "ssl set verify", Result, h_nssl_SetVerify, uint32_t id, uint32_t v) { (void)id; (void)v; return RES_OK; }
 HLE_FORCE("nnsslContextDestroy", "ssl ctx destroy", Result, h_nssl_CtxDestroy, uint32_t id) { (void)id; return RES_OK; }
 HLE_FORCE("nnsslContextGetContextId", "ssl ctx id", Result, h_nssl_CtxGetId, void *self, uint32_t *id) { (void)self; if (id) *id = 1; return RES_OK; }
+
+static Result nifm_request_answer(sf_req *q) {
+    LOG("sf: nifm IRequest command %u", q->cmd);
+    if (q->cmd == 0) { // GetRequestState
+        q->out_len = 4;
+        *(uint32_t *)q->out = 1; // 1 = Complete
+        return RES_OK;
+    }
+    if (q->cmd == 1) { // GetResult
+        return RES_OK;
+    }
+    if (q->cmd == 2) { // GetSystemEvent
+        q->out_copy = hle_new_event(NULL);
+        return RES_OK;
+    }
+    if (q->cmd == 3) { // Cancel
+        return RES_OK;
+    }
+    if (q->cmd == 4) { // Submit
+        return RES_OK;
+    }
+    return RES_OK;
+}
+
+static Result nifm_general_answer(sf_req *q) {
+    LOG("sf: nifm IGeneralService command %u", q->cmd);
+    if (q->cmd == 4) { // CreateRequest
+        q->out_move = sf_session("IRequest", nifm_request_answer, NULL, NULL);
+        return RES_OK;
+    }
+    if (q->cmd == 5) { // GetCurrentIpAddress
+        q->out_len = 4;
+        *(uint32_t *)q->out = 0x0100007f; // 127.0.0.1
+        return RES_OK;
+    }
+    if (q->cmd == 12) { // GetCurrentIpConfigInfo
+        return RES_OK;
+    }
+    if (q->cmd == 15) { // IsAnyInternetRequestAccepted
+        q->out_len = 1;
+        *(uint8_t *)q->out = 1;
+        return RES_OK;
+    }
+    return RES_OK;
+}
+
+static Result nifm_static_answer(sf_req *q) {
+    LOG("sf: nifm command %u (%zu data words in)", q->cmd, q->in_len / 4);
+    if (q->cmd == 4 || q->cmd == 5) { // CreateGeneralServiceOld / CreateGeneralService
+        q->out_move = sf_session("IGeneralService", nifm_general_answer, NULL, NULL);
+        return RES_OK;
+    }
+    return RES_OK;
+}
+static Result nifm_u_answer(sf_req *q) { return nifm_static_answer(q); }
+static Result nifm_s_answer(sf_req *q) { return nifm_static_answer(q); }
+static Result nifm_a_answer(sf_req *q) { return nifm_static_answer(q); }
+SF_SERVICE("nifm:u", nifm_u_answer);
+SF_SERVICE("nifm:s", nifm_s_answer);
+SF_SERVICE("nifm:a", nifm_a_answer);
+

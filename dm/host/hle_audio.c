@@ -89,6 +89,14 @@ static void *event_notify(void *p) {
     return NULL;
 }
 
+static _Atomic uint32_t g_host_duck_bits = 0x3f800000u; // 1.0f
+void dm_audio_set_duck(float scale) {
+    if (scale < 0.0f) scale = 0.0f;
+    if (scale > 1.0f) scale = 1.0f;
+    uint32_t b; memcpy(&b, &scale, 4);
+    atomic_store_explicit(&g_host_duck_bits, b, memory_order_relaxed);
+}
+
 // Take n bytes from the pending queue and hand them to the output side; once a whole block has played, move it to released and notify the ordinary thread.
 static void pull(aout *a, uint8_t *dst, uint64_t n) {
     int released = 0;
@@ -114,9 +122,12 @@ static void pull(aout *a, uint8_t *dst, uint64_t n) {
             a->pos = 0; released = 1;
         }
     }
+    float v = 1.0f;
     uint32_t vb = atomic_load_explicit(&a->vol, memory_order_relaxed);
-    if (vb != 0x3f800000u) {   // the output's volume (SetAudioOutVolume), as the audout session applies it to the PCM16 it plays; saturating
-        float v; memcpy(&v, &vb, 4);
+    if (vb != 0x3f800000u) memcpy(&v, &vb, 4);
+    uint32_t db = atomic_load_explicit(&g_host_duck_bits, memory_order_relaxed);
+    if (db != 0x3f800000u) { float d; memcpy(&d, &db, 4); v *= d; }
+    if (v != 1.0f) {   // the output's volume (SetAudioOutVolume) * host ducking, saturating
         for (uint64_t i = 0; i < ns; i++) { float x = s16[i] * v; s16[i] = (int16_t)(x > 32767.f ? 32767.f : x < -32768.f ? -32768.f : x); }
     }
     if (released) {

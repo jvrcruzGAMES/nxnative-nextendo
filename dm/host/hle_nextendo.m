@@ -1,6 +1,9 @@
 // Nextendo Network integration implementation for nxnative
 #import <Foundation/Foundation.h>
+#import <TargetConditionals.h>
+#if TARGET_OS_IPHONE
 #import <Security/Security.h>
+#endif
 #import <pthread.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -56,6 +59,16 @@ static BOOL wildcard_match(const char *pattern, const char *str) {
     return (!*pattern && !*str);
 }
 
+#if !TARGET_OS_IPHONE
+static NSString *mac_auth_path(void) {
+    const char *env = getenv("DM_NEXTENDO_AUTH");
+    if (env && env[0]) return [NSString stringWithUTF8String:env];
+    NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES);
+    NSString *base = dirs.count ? [dirs[0] stringByAppendingPathComponent:@"nxnative"] : [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/nxnative"];
+    return [base stringByAppendingPathComponent:@"nextendo_auth.json"];
+}
+#endif
+
 int nextendo_keychain_save(const char *token, const char *username, uint64_t pid) {
     if (!token || !*token) return 0;
     @autoreleasepool {
@@ -67,6 +80,7 @@ int nextendo_keychain_save(const char *token, const char *username, uint64_t pid
         NSData *data = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
         if (!data) return 0;
 
+#if TARGET_OS_IPHONE
         NSDictionary *query = @{
             (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
             (__bridge id)kSecAttrService: @"network.nextendo.auth",
@@ -80,11 +94,20 @@ int nextendo_keychain_save(const char *token, const char *username, uint64_t pid
 
         OSStatus st = SecItemAdd((__bridge CFDictionaryRef)attrs, NULL);
         return (st == errSecSuccess) ? 1 : 0;
+#else
+        NSString *path = mac_auth_path();
+        NSString *dir = [path stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        if (![data writeToFile:path options:NSDataWritingAtomic error:nil]) return 0;
+        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0600} ofItemAtPath:path error:nil];
+        return 1;
+#endif
     }
 }
 
 int nextendo_keychain_load(char *token_out, size_t token_cap, char *user_out, size_t user_cap, uint64_t *pid_out) {
     @autoreleasepool {
+#if TARGET_OS_IPHONE
         NSDictionary *query = @{
             (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
             (__bridge id)kSecAttrService: @"network.nextendo.auth",
@@ -101,6 +124,13 @@ int nextendo_keychain_load(char *token_out, size_t token_cap, char *user_out, si
         NSError *error = nil;
         NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
         CFRelease(result);
+#else
+        NSString *path = mac_auth_path();
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data) return 0;
+        NSError *error = nil;
+        NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+#endif
         if (error || ![dict isKindOfClass:[NSDictionary class]]) {
             return 0;
         }
@@ -133,6 +163,7 @@ int nextendo_keychain_load(char *token_out, size_t token_cap, char *user_out, si
 
 int nextendo_keychain_delete(void) {
     @autoreleasepool {
+#if TARGET_OS_IPHONE
         NSDictionary *query = @{
             (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
             (__bridge id)kSecAttrService: @"network.nextendo.auth",
@@ -140,6 +171,11 @@ int nextendo_keychain_delete(void) {
         };
         OSStatus st = SecItemDelete((__bridge CFDictionaryRef)query);
         return (st == errSecSuccess || st == errSecItemNotFound) ? 1 : 0;
+#else
+        NSString *path = mac_auth_path();
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return 1;
+        return [[NSFileManager defaultManager] removeItemAtPath:path error:nil] ? 1 : 0;
+#endif
     }
 }
 
@@ -478,9 +514,19 @@ int nextendo_redirect_host(const char *host, char *out_ip, size_t out_sz, char *
         return 0;
     }
 
+    const char *h = host;
+    if (strncmp(h, "http://", 7) == 0) h += 7;
+    else if (strncmp(h, "https://", 8) == 0) h += 8;
+    else if (strncmp(h, "ws://", 5) == 0) h += 5;
+    else if (strncmp(h, "wss://", 6) == 0) h += 6;
+
     char eff_host[256];
-    strncpy(eff_host, host, sizeof(eff_host) - 1);
+    strncpy(eff_host, h, sizeof(eff_host) - 1);
     eff_host[sizeof(eff_host) - 1] = '\0';
+    char *slash = strchr(eff_host, '/');
+    if (slash) *slash = '\0';
+    char *colon = strchr(eff_host, ':');
+    if (colon) *colon = '\0';
 
     // Replace % with lp1
     char *pct = strchr(eff_host, '%');

@@ -1509,6 +1509,28 @@ def mtarc_shaders(d, label, out):
 
 SCNE, ZSTD_MAGIC = b'SCNE', bytes.fromhex('28b52ffd')
 LZ4_FRAME_MAGIC = bytes.fromhex('04224d18')   # the frame of HAL's other .cmp container (the ubin/ map data)
+ZCMP = b'ZCMP'
+def me01_members(d, label):
+    """ZCMP / ME01 Nintendo archive (Mii Maker 0100000000001009 RomFS/archive/*.bin.cmp):
+    ZCMP header: 0x80 bytes, zlib deflate stream at 0x80 decompressing to ME01 archive.
+    ME01 header: +0x04 u32 count, +0x08 u32 base_offset, +0x10 (count-1) relative offsets,
+    then count sizes, then count 0x80-byte NUL-terminated filenames.
+    → (path, data) of each entry"""
+    if d[:4] == ZCMP and len(d) > 0x80:
+        d = zlib.decompress(d[0x80:])
+    if d[:4] != b'ME01' or len(d) < 16: return
+    count, base_offset = struct.unpack_from('<II', d, 4)
+    if not (0 < count <= 10000): return
+    sizes_off = 0x10 + (count - 1) * 4
+    names_off = sizes_off + count * 4
+    if names_off + count * 0x80 > len(d): return
+    for i in range(count):
+        sz = struct.unpack_from('<I', d, sizes_off + i * 4)[0]
+        name = d[names_off + i * 0x80 : names_off + (i + 1) * 0x80].split(b'\x00')[0].decode('utf-8', 'replace')
+        off = base_offset if i == 0 else base_offset + struct.unpack_from('<I', d, 0x10 + (i - 1) * 4)[0]
+        if off + sz <= len(d):
+            yield name, d[off:off + sz]
+
 def bea_members(d, label):
     """NintendoWare Bezel Engine archive ('.bea', magic 'SCNE', a NintendoWare binary file of version 0x10100; Big Brain Academy: Brain vs. Brain keeps nearly all of RomFS in 603 of them):
     +0x20 u64 entry count, +0x28 u64 offset of the entry pointer array (u64 each), each pointing at a 0x30-byte 'ASST' entry {+0x10 u16 kind, u16 alignment shift, u32 stored length,
@@ -3613,6 +3635,9 @@ def scan_file_in(args):
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] == SCNE:   # a Bezel Engine archive (bea_members): each entry scanned as a file of its own (the shaders are BNSH in its .bfsha entries)
         for nm, m in bea_members(open(path, 'rb').read(), '/' + rel): scan_blob(m, f'/{rel}/{nm}', found)
+        return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:4] == ZCMP:   # a Nintendo ZCMP / ME01 archive (me01_members): entries scanned as files of their own (Mii Maker)
+        for nm, m in me01_members(open(path, 'rb').read(), '/' + rel): scan_blob(m, f'/{rel}/{nm}', found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:8] == GFPAK:   # a Game Freak archive (gfpak_members): each entry scanned as a file of its own (the shaders are BNSH entries)
         for nm, m in gfpak_members(open(path, 'rb').read(), '/' + rel): scan_blob(m, f'/{rel}{nm}', found)

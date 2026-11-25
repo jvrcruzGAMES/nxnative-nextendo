@@ -15,8 +15,26 @@
 
 #define SF_H0 0xd0000u   // session handles: outside the kernel handle table (0x1000 + slot, 4096 slots, hle_thread.c)
 #define SF_MAX 64
+#define SF_MAX_DOMAIN_OBJS 32
+
+typedef struct {
+    int used;
+    char name[16];
+    sf_answer answer;
+    void *ctx;
+    void (*close)(void *);
+} sf_dom_obj;
+
 // A session: its service's answer (sf_req, hle.h; NULL: success with zeroed output, as for olsc:u), its own state, and what to do with that state when the session closes
-static struct { char name[16]; int used, domain; unsigned seen; sf_answer answer; void *ctx; void (*close)(void *); } g_sf[SF_MAX];
+static struct {
+    char name[16];
+    int used, domain;
+    unsigned seen;
+    sf_answer answer;
+    void *ctx;
+    void (*close)(void *);
+    sf_dom_obj objs[SF_MAX_DOMAIN_OBJS];
+} g_sf[SF_MAX];
 static pthread_mutex_t g_sf_mu = PTHREAD_MUTEX_INITIALIZER;
 // notif:a, the reminder alarms (nn::notification, linked by most SDKs; Fit Boxing 3 lists them when its Settings open, PR 1974): the SDK's client sends only 1000 Initialize (with the process
 // ID), 500 Register, 510 Update, 520 List, 530 LoadApplicationParameter and 540 Delete (SDK 21's sdk+0x58ac80..0x58ad10), and aborts on any failure; its notification event comes from am.
@@ -34,7 +52,7 @@ static int sf_slot(uint32_t h) {
     unsigned i = h - SF_H0;
     return i < SF_MAX && g_sf[i].used ? (int)i : -1;
 }
-static uint32_t sf_new(const char *name, int domain, sf_answer answer, void *ctx, void (*close)(void *)) {
+uint32_t sf_new(const char *name, int domain, sf_answer answer, void *ctx, void (*close)(void *)) {
     pthread_mutex_lock(&g_sf_mu);
     unsigned i = 0; while (i < SF_MAX && g_sf[i].used) i++;
     if (i == SF_MAX) die("sf: more than %d host service sessions", SF_MAX);
@@ -89,17 +107,57 @@ HLE_FORCE("_ZN2nn2sf4hipc20ConnectToHipcServiceEPNS_3svc6HandleEPKc", "connect t
     LOG("[RED] sf: the game connects to service %.8s itself, which the host does not serve", name);
     return 0xe15u;   // sm ResultNotRegistered
 }
+
+static Result lm_logger_answer(sf_req *q) {
+    return RES_OK;
+}
+
+static Result lm_answer(sf_req *q) {
+    if (q->cmd == 0) { // OpenLogger
+        q->out_move = sf_new("ILogger", 0, lm_logger_answer, NULL, NULL);
+        return RES_OK;
+    }
+    return RES_OK;
+}
+SF_SERVICE("lm", lm_answer);
+
+static Result sm_answer(sf_req *q) {
+    if (q->cmd == 0) return RES_OK; // Initialize
+    if (q->cmd == 1) { // GetService
+        char name[9] = {0};
+        if (q->in_len >= 8) memcpy(name, q->in, 8);
+        uint32_t h = 0;
+        Result r = h_sf_Connect(&h, name);
+        if (r == RES_OK) {
+            q->out_move = h;
+            LOG("sm: GetService('%.8s') -> session %#x", name, h);
+            return RES_OK;
+        }
+        LOG("[RED] sm: GetService('%.8s') not registered", name);
+        return 0xe15u;
+    }
+    return RES_OK;
+}
+SF_SERVICE("sm:", sm_answer);
 HLE_FORCE("_ZN2nn2sf4hipc24CloseClientSessionHandleENS_3svc6HandleE", "close a session (kernel handle) → the host session", void, h_sf_Close, uint32_t h) {
     int i = sf_slot(h);
     if (i < 0) { LOG("[RED] sf: CloseClientSessionHandle on %#x, not a host session", h); return; }
-    pthread_mutex_lock(&g_sf_mu); void (*close)(void *) = g_sf[i].close; void *ctx = g_sf[i].ctx; g_sf[i].used = 0; g_sf[i].close = NULL; g_sf[i].ctx = NULL; pthread_mutex_unlock(&g_sf_mu);
+    pthread_mutex_lock(&g_sf_mu);
+    for (int k = 2; k < SF_MAX_DOMAIN_OBJS; k++) {
+        if (g_sf[i].objs[k].used && g_sf[i].objs[k].close) {
+            g_sf[i].objs[k].close(g_sf[i].objs[k].ctx);
+        }
+        g_sf[i].objs[k].used = 0;
+    }
+    void (*close)(void *) = g_sf[i].close; void *ctx = g_sf[i].ctx; g_sf[i].used = 0; g_sf[i].close = NULL; g_sf[i].ctx = NULL;
+    pthread_mutex_unlock(&g_sf_mu);
     if (close) close(ctx);   // the session's own state ends with it (an audio renderer stops rendering)
 }
 // Control requests: the pointer buffer is the server's receive buffer for X descriptors (none: the host reads them in place), the domain conversion makes the session's object 1, a duplicate
 // is a new session to the same object
-HLE_FORCE("_ZN2nn2sf4hipc6client22QueryPointerBufferSizeEPtNS_3svc6HandleE", "control request: pointer buffer size of a session → 0 for a host session", Result, h_sf_PtrBuf, uint16_t *out, uint32_t h) {
+HLE_FORCE("_ZN2nn2sf4hipc6client22QueryPointerBufferSizeEPtNS_3svc6HandleE", "control request: pointer buffer size of a session → 0x500 for a host session", Result, h_sf_PtrBuf, uint16_t *out, uint32_t h) {
     if (sf_slot(h) < 0) { LOG("[RED] sf: QueryPointerBufferSize on %#x, not a host session", h); return RES_FAIL; }
-    *out = 0; return RES_OK;
+    *out = 0x500; return RES_OK;
 }
 HLE_FORCE("_ZN2nn2sf4hipc6client22ConvertSessionToDomainEPNS0_4cmif18CmifDomainObjectIdENS_3svc6HandleE", "control request: convert a session to a domain → the host session's object 1", Result, h_sf_ToDomain,
           uint32_t *out, uint32_t h) {
@@ -137,28 +195,117 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
     for (unsigned k = 0; k < na + nb + nw; k++, p += 3) {
         uint8_t *a = (uint8_t *)(uintptr_t)sf_desc_addr(p[1], p[2] >> 28, p[2] >> 2 & 0x3fffff); uint64_t n = p[0] | (uint64_t)(p[2] >> 24 & 15) << 32;
         if (k < na) { if (q.na < 4) { q.a[q.na].p = a; q.a[q.na++].size = n; } }
-        else if (k < na + nb) { if (q.nb < 4) { q.b[q.nb].p = a; q.b[q.nb++].size = n; } }
+        else if (k < na + nb) { if (a && q.nb < 4) { q.b[q.nb].p = a; q.b[q.nb++].size = n; } }
     }
     size_t data = (size_t)((uint8_t *)p - base), cm = (data + 15) & ~(size_t)15;
     int dom = g_sf[i].domain && (type == 4 || type == 6);
     unsigned dtype = dom ? base[cm] : 1, obj = dom ? *(uint32_t *)(base + cm + 4) : 0;
     size_t hin = cm + (dom ? 16 : 0);
+    unsigned rlist = (m[1] >> 10) & 15;
+    if (rlist > 1) {
+        uint32_t *dw = (uint32_t *)(base + cm);
+        for (int k = (int)ndw - 2; k >= 4; k--) {
+            uint64_t a = (uint64_t)dw[k] | ((uint64_t)(dw[k+1] & 0xffff) << 32);
+            uint64_t n = dw[k+1] >> 16;
+            if (n > 0 && n < 0x100000 && a >= 0x7000000000ULL && a < 0x8000000000ULL) {
+                if (q.nb < 4) { q.b[q.nb].p = (uint8_t *)(uintptr_t)a; q.b[q.nb++].size = n; }
+                break;
+            }
+        }
+    }
     if (hin + 16 > size || data + ndw * 4 > size) { LOG("[RED] sf: %s: request of %u data words does not fit %llu bytes", g_sf[i].name, ndw, (unsigned long long)size); return 0xe401u; }
     uint32_t magic = *(uint32_t *)(base + hin), ver = *(uint32_t *)(base + hin + 4), cmd = *(uint32_t *)(base + hin + 8);
     static int trace = -1; if (trace < 0) trace = getenv("DM_SF_TRACE") && atoi(getenv("DM_SF_TRACE"));
     if (trace) { char hx[3 * 0x80 + 1] = ""; for (unsigned k = 0; k < 0x80 && k < size; k++) snprintf(hx + 3 * k, 4, "%02x ", base[k]); LOG("sf: %s request: %s", g_sf[i].name, hx); }
     if (type == 2) return 0xf601u;   // HIPC Close: the session ends, and the kernel answers the closed-session result (SDK 21's client sends one for a session it is done with: Star Fox's camera session)
+    if (type == 5 || type == 7) {
+        if (magic != 0x49434653) { LOG("[RED] sf: %s: control request without SFCI (%#x)", g_sf[i].name, magic); return 0xe401u; }
+        Result res = RES_OK;
+        if (cmd == 0) { // ConvertCurrentObjectToDomain
+            g_sf[i].domain = 1;
+            q.out_len = 4;
+            *(uint32_t *)q.out = 1; // root object ID
+            if (trace) LOG("sf: %s converted to domain (object 1)", g_sf[i].name);
+        } else if (cmd == 2 || cmd == 4) { // DuplicateSession
+            q.out_move = sf_new(g_sf[i].name, g_sf[i].domain, g_sf[i].answer, g_sf[i].ctx, NULL);
+            if (trace) LOG("sf: %s DuplicateSession -> %#x", g_sf[i].name, q.out_move);
+        } else if (cmd == 3) { // QueryPointerBufferSize
+            q.out_len = 4;
+            *(uint16_t *)q.out = 0x500; // pointer buffer size 0x500
+            if (trace) LOG("sf: %s QueryPointerBufferSize -> 0x500", g_sf[i].name);
+        } else {
+            LOG("[RED] sf: %s: unknown control command %u", g_sf[i].name, cmd);
+            res = 0xe401u;
+        }
+        unsigned nc = q.out_copy ? 1 : 0, nm = q.out_move ? 1 : 0;
+        size_t end = size < 0x1000 ? size : 0x1000, dw = 8 + (nc + nm ? 4 + 4 * (nc + nm) : 0);
+        memset(base, 0, end);
+        m[1] = (uint32_t)((end - dw) / 4 < 0x3ff ? (end - dw) / 4 : 0x3ff);
+        if (nc + nm) { m[1] |= 1u << 31; m[2] = nc << 1 | nm << 5; if (nc) m[3] = q.out_copy; if (nm) m[3 + nc] = q.out_move; }
+        size_t out = (dw + 15) & ~(size_t)15;
+        uint32_t *o = (uint32_t *)(base + out); o[0] = 0x4f434653; o[1] = ver; o[2] = res; o[3] = 0;
+        if (!res && q.out_len) memcpy(base + out + 16, q.out, q.out_len <= sizeof q.out && out + 16 + q.out_len <= end ? q.out_len : 0);
+        return RES_OK;
+    }
     if (type != 4 && type != 6) { LOG("[RED] sf: %s: HIPC message type %u not served", g_sf[i].name, type); return 0xe401u; }
-    if (dtype == 2) { memset(base, 0, 16); return RES_OK; }   // a domain object closed: nothing to answer
+    if (dtype == 2) {
+        if (dom && obj > 1 && obj < SF_MAX_DOMAIN_OBJS && g_sf[i].objs[obj].used) {
+            pthread_mutex_lock(&g_sf_mu);
+            void (*close)(void *) = g_sf[i].objs[obj].close;
+            void *ctx = g_sf[i].objs[obj].ctx;
+            g_sf[i].objs[obj].used = 0;
+            g_sf[i].objs[obj].close = NULL;
+            g_sf[i].objs[obj].ctx = NULL;
+            pthread_mutex_unlock(&g_sf_mu);
+            if (close) close(ctx);
+        }
+        memset(base, 0, 16);
+        return RES_OK;
+    }   // a domain object closed: nothing to answer
     if (magic != 0x49434653) { LOG("[RED] sf: %s: request without SFCI (%#x)", g_sf[i].name, magic); return 0xe401u; }
     size_t end_in = data + ndw * 4;
-    q.cmd = cmd & 0xffff; q.object = obj; q.in = base + hin + 16; q.in_len = end_in > hin + 16 ? end_in - hin - 16 : 0; q.ctx = g_sf[i].ctx;
+    q.cmd = cmd & 0xffff; q.object = obj; q.in = base + hin + 16; q.in_len = end_in > hin + 16 ? end_in - hin - 16 : 0;
+    sf_answer ans = g_sf[i].answer; void *ctx = g_sf[i].ctx;
+    const char *obj_name = g_sf[i].name;
+    if (dom && obj > 1 && obj < SF_MAX_DOMAIN_OBJS && g_sf[i].objs[obj].used) {
+        ans = g_sf[i].objs[obj].answer;
+        ctx = g_sf[i].objs[obj].ctx;
+        obj_name = g_sf[i].objs[obj].name;
+    }
+    q.ctx = ctx;
     unsigned key = (obj & 0xff) << 16 | (cmd & 0xffff);   // log each object / command once
     pthread_mutex_lock(&g_sf_mu); int first = g_sf[i].seen != key; g_sf[i].seen = key; pthread_mutex_unlock(&g_sf_mu);
-    Result res = g_sf[i].answer ? g_sf[i].answer(&q) : RES_OK;
-    if (q.out_move && dom) { LOG("[RED] sf: %s: command %u returns an object in a domain, which the host does not serve", g_sf[i].name, q.cmd); q.out_move = 0; res = 0xe401u; }
-    if (first || trace) LOG("sf: %s object %u command %u (%u data words in): %s%s%s", g_sf[i].name, obj, cmd, ndw, res ? "fails" : g_sf[i].answer ? "success" : "success, zeroed output",
-                            q.out_copy ? ", a copied handle" : "", q.out_move ? ", a moved session" : "");
+    Result res = ans ? ans(&q) : RES_OK;
+    uint32_t out_obj_id = 0;
+    if (q.out_move && dom) {
+        uint32_t moved_h = q.out_move;
+        int mslot = sf_slot(moved_h);
+        pthread_mutex_lock(&g_sf_mu);
+        int new_obj = -1;
+        for (int k = 2; k < SF_MAX_DOMAIN_OBJS; k++) {
+            if (!g_sf[i].objs[k].used) { new_obj = k; break; }
+        }
+        if (new_obj < 0) die("sf: %s: domain object table full", g_sf[i].name);
+        g_sf[i].objs[new_obj].used = 1;
+        if (mslot >= 0) {
+            strlcpy(g_sf[i].objs[new_obj].name, g_sf[mslot].name, sizeof g_sf[i].objs[new_obj].name);
+            g_sf[i].objs[new_obj].answer = g_sf[mslot].answer;
+            g_sf[i].objs[new_obj].ctx = g_sf[mslot].ctx;
+            g_sf[i].objs[new_obj].close = g_sf[mslot].close;
+            g_sf[mslot].used = 0;
+        }
+        pthread_mutex_unlock(&g_sf_mu);
+        out_obj_id = (uint32_t)new_obj;
+        q.out_move = 0;
+    }
+    if (first || trace || cmd == 8) {
+        char hx[3 * 0x80 + 1] = ""; for (unsigned k = 0; k < 0x40 && k < size; k++) snprintf(hx + 3 * k, 4, "%02x ", base[k]);
+        LOG("sf: %s raw msg (cmd %u): %s", g_sf[i].name, cmd, hx);
+    }
+    if (first || trace) LOG("sf: %s (%s) object %u command %u (%u data words in): %s%s%s%s", g_sf[i].name, obj_name, obj, cmd, ndw,
+                            res ? "fails" : ans ? "success" : "success, zeroed output",
+                            q.out_copy ? ", a copied handle" : "", q.out_move ? ", a moved session" : "",
+                            out_obj_id ? ", domain object" : "");
     // The response: no descriptors. The special header (its handle counts) and the handles come right after the HIPC header, when there are any; the CMIF part starts at the next
     // 16-byte boundary (+0x10 with none or one handle), the domain's out header first in a domain. Everything after it up to the buffer's end reads as zero
     unsigned nc = q.out_copy ? 1 : 0, nm = q.out_move ? 1 : 0;
@@ -167,7 +314,29 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
     m[1] = (uint32_t)((end - dw) / 4 < 0x3ff ? (end - dw) / 4 : 0x3ff);
     if (nc + nm) { m[1] |= 1u << 31; m[2] = nc << 1 | nm << 5; if (nc) m[3] = q.out_copy; if (nm) m[3 + nc] = q.out_move; }
     size_t out = ((dw + 15) & ~(size_t)15) + (dom ? 16 : 0);
+    if (dom) {
+        uint32_t *dhead = (uint32_t *)(base + out - 16);
+        dhead[0] = out_obj_id ? 1 : 0;
+    }
     uint32_t *o = (uint32_t *)(base + out); o[0] = 0x4f434653; o[1] = ver; o[2] = res; o[3] = 0;   // "SFCO"; a domain's out-object count before it stays 0
     if (!res && q.out_len) memcpy(base + out + 16, q.out, q.out_len <= sizeof q.out && out + 16 + q.out_len <= end ? q.out_len : 0);
+    if (dom && out_obj_id) {
+        size_t obj_off = out + 16 + ((q.out_len + 3) & ~(size_t)3);
+        if (obj_off + 4 <= end) *(uint32_t *)(base + obj_off) = out_obj_id;
+    }
     return RES_OK;
+    if (!res && q.out_len) memcpy(base + out + 16, q.out, q.out_len <= sizeof q.out && out + 16 + q.out_len <= end ? q.out_len : 0);
+    return RES_OK;
+}
+
+uint32_t sf_connect(const char *name) {
+    uint32_t h = 0;
+    Result r = h_sf_Connect(&h, name);
+    return r == RES_OK ? h : 0;
+}
+void sf_close(uint32_t h) {
+    h_sf_Close(h);
+}
+uint32_t sf_send_sync(uint32_t h, uint32_t *m, uint64_t size) {
+    return (uint32_t)h_sf_Send(h, m, size);
 }

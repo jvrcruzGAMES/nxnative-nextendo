@@ -891,6 +891,14 @@ void load_modules(const char *dir, const char **names, int n) {
     force_init();
     t = now_ns(); for (int i = 0; i < g_nmod; i++) relocate(&g_mod[i]); tr = now_ns() - t;
     force_check();
+    for (int i = 0; i < g_nmod; i++) {
+        module_t *m = &g_mod[i];
+        if (!strcmp(m->name, "main") && !strcmp(m->build_id, "880cb7307525d961f4ea9f4e0b3b7f6c")) {
+            extern void *h_nvn_static_bootstrap(void *, const char *);
+            *(void **)(m->base + 0x5aa5e0) = (void *)h_nvn_static_bootstrap;
+            LOG("[hle] main 0100000000001009: bound static NVN loader at 0x5aa5e0 -> %p", (void *)h_nvn_static_bootstrap);
+        }
+    }
     preload_nros(dir, nros);   // mapped now, relocated when the game loads them (hle_ro.c)
     { void hlecount_seal(void); hlecount_seal(); }   // DM_HLECOUNT: relocation done, seal the counting stub pages as read-only executable
     if (getenv("DM_SYMCHECK")) LOG("DM_SYMCHECK: %lu symbol lookups at load time, hash and linear disagree %lu", g_symchk_n, g_symchk_bad);

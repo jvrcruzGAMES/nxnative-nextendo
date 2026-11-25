@@ -15,11 +15,24 @@ static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("missing symbo
 // Game arguments: argv[0] is fixed to "game", and whatever follows "--" is appended as is (on a real device nn::init takes them from the process argument area and hands them to the SDK through SetHostArgc/Argv)
 static char *g_argv[64] = {"game"}; static int g_argc = 1;
 
+static void dummy_cb(void) {}
+static void init_cb(void) { run_module_inits(); }
+
 static void guest_main(void) {
     guest_thread_init();
     guest_gate_stack(0);   // the guest code runs on this thread's own stack: its SVCs get a stack of their own
     { void dm_oodle_serve_maybe(int); dm_oodle_serve_maybe(0); }   // DM_OODLE_SERVE tool mode: the game's own Oodle decoder over stdin / stdout (hle_oodle.c, exits when the input ends)
     uint32_t hmain = svc_thread_main_init();   // Main thread handle: x0 of nnosInitialize (stored in an sdk global, used by ThreadManagerImplByHorizon); x1 = pointer to the argument area
+
+    void *start_fn = guest_sym("_ZN2nn4init5StartEmmPFvvES2_S2_");
+    if (start_fn && !guest_sym("_init_libc0")) {
+        LOG(">>> nn::init::Start (statically linked binary)");
+        typedef void (*start_t)(uint64_t, uint64_t, void (*)(void), void (*)(void), void (*)(void));
+        ((start_t)start_fn)(hmain, 0, dummy_cb, init_cb, dummy_cb);
+        LOG("nn::init::Start returned");
+        return;
+    }
+
     // Copy Start step by step: _init_libc1 = __nnmusl_init_locks (initializes the stdio etc. locks as recursive locks; skipping it self-deadlocks on nested locking in putc) + __init_ssp.
     // The three callbacks passed in by rtld: A only sets an rtld flag (skipped), B = each module's DT_INIT (before nnMain), C = destructors (not done)
     ((fn0)req("_init_libc0"))();

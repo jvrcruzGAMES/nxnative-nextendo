@@ -7433,6 +7433,16 @@ _nvnth_742:
     stadd x17, [x16]
     ldr x17, [x16, #8]
     br x17
+    .globl _nvnth_743
+_nvnth_743:
+    adrp x16, _nvn_slot@PAGE
+    add x16, x16, _nvn_slot@PAGEOFF
+    mov x17, #11888
+    add x16, x16, x17
+    mov x17, #1
+    stadd x17, [x16]
+    ldr x17, [x16, #8]
+    br x17
     .globl _nvnthf_0
 _nvnthf_0:
     adrp x16, _nvn_slot@PAGE
@@ -13377,6 +13387,14 @@ _nvnthf_742:
     add x16, x16, x17
     ldr x17, [x16, #8]
     br x17
+    .globl _nvnthf_743
+_nvnthf_743:
+    adrp x16, _nvn_slot@PAGE
+    add x16, x16, _nvn_slot@PAGEOFF
+    mov x17, #11888
+    add x16, x16, x17
+    ldr x17, [x16, #8]
+    br x17
     .data
     .p2align 3
     .globl _nvn_thunk
@@ -14124,6 +14142,7 @@ _nvn_thunk:
     .quad _nvnth_740
     .quad _nvnth_741
     .quad _nvnth_742
+    .quad _nvnth_743
     .globl _nvn_thunk_fast
 _nvn_thunk_fast:
     .quad _nvnthf_0
@@ -14869,6 +14888,7 @@ _nvn_thunk_fast:
     .quad _nvnthf_740
     .quad _nvnthf_741
     .quad _nvnthf_742
+    .quad _nvnthf_743
     .globl _nvn_names
 _nvn_names:
     .quad Ln0
@@ -15614,6 +15634,7 @@ _nvn_names:
     .quad Ln740
     .quad Ln741
     .quad Ln742
+    .quad Ln743
     .cstring
 Ln0: .asciz "nvnDeviceBuilderSetDefaults"
 Ln1: .asciz "nvnDeviceBuilderSetFlags"
@@ -16358,3 +16379,4 @@ Ln739: .asciz "nvnWindowBuilderSetAcquireTimeout"
 Ln740: .asciz "nvnWindowBuilderGetAcquireTimeout"
 Ln741: .asciz "nvnWindowSetAcquireTimeout"
 Ln742: .asciz "nvnWindowGetAcquireTimeout"
+Ln743: .asciz "nvnSyncInitializeFromNvRmSyncNVX"

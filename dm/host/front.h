@@ -84,6 +84,27 @@ void front_save_failed(int err);
 // front end keeps: a FATAL line and an abort. Called on Metal's feedback queue; the front end switches to the main thread itself and must not block
 void front_gpu_lost(void);
 
+// Host-level audio ducking (0.0 .. 1.0, default 1.0): used when a library applet is overlaid on top of the game.
+void dm_audio_set_duck(float scale);
+// In-window library applet surface sharing (Mac front end -> nvn_mtl.m): when active, presents render into the shared IOSurface instead of a CAMetalDrawable.
+int front_applet_present_mode(void);
+void *front_applet_surface_texture(int idx, void *mtl_device);
+void front_applet_did_present(int idx);
+typedef struct {
+    uint32_t surf_ids[2];
+    _Atomic uint32_t frame_seq;
+    _Atomic uint32_t frame_idx;
+    _Atomic uint32_t out_ready;
+    _Atomic int32_t out_result;
+    _Atomic int32_t out_index;
+    _Atomic uint64_t kbd_btn;
+    _Atomic int32_t kbd_lx, kbd_ly, kbd_rx, kbd_ry;
+    _Atomic uint64_t pad_btn;
+    _Atomic int32_t pad_lx, pad_ly, pad_rx, pad_ry;
+    _Atomic int32_t touch_n;
+    dm_touch touch[16];
+} dm_applet_shm_t;
+
 // Offline HTML pages (the web applet's offline pages; hle_web.c): a web view over the game picture (web_apple.m, Mac and iPhone). Called from guest threads; the front end works on its main
 // thread. front_web_open: dir = the folder the document path is relative to (an HtmlDocument's html-document), path = the document path with its query, callback = the URL prefix whose
 // loading ends the page (exit reason 3, the URL as the last URL), hidden = loaded without being shown until front_web_show. 0 = opened; -1 = no web view (no window): the caller's

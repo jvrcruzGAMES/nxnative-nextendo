@@ -30,7 +30,7 @@
 #define WAITERS_BIT   0x40000000u
 #define H_CUR_THREAD  0xFFFF8000u
 
-enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W };
+enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_SHMEM };
 enum { MAX_SYNC_OBJECTS = 64 };
 typedef struct { void *obj; int type; } sync_ref_t;
 // Service-layer SystemEvent bindings (see hle_bind_system_event): guest SystemEventType address → the write-end handle of its kernel event.
@@ -1331,6 +1331,9 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             if (g_h[i].type == O_EVENT_W) se_unbind((uint32_t)regs[0]);
             event_t *e = g_h[i].obj; if (--e->refs == 0) free(e);
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
+        } else if (i > 0 && i < MAX_H && g_h[i].type == O_SHMEM) {
+            free(g_h[i].obj);
+            g_h[i].type = O_FREE; g_h[i].obj = NULL;
         } else if (i > 0 && i < MAX_H && g_h[i].type == O_THREAD) {
             thr_t *t = g_h[i].obj;
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
@@ -1383,6 +1386,28 @@ int hle_signal_event_handle(uint32_t write_end) {   // Signal a host-made kernel
     if (e) { e->signaled = 1; wake_sync_waiters(e); }
     g_unlock();
     return e != NULL;
+}
+typedef struct {
+    void *ptr;
+    size_t size;
+} hle_shmem_t;
+
+uint32_t hle_new_shmem(void *ptr, size_t size) {
+    hle_shmem_t *s = malloc(sizeof *s);
+    s->ptr = ptr; s->size = size;
+    g_lock();
+    uint32_t h = h_new(O_SHMEM, s);
+    g_unlock();
+    return h;
+}
+
+void *hle_get_shmem(uint32_t h, size_t *size) {
+    g_lock();
+    hle_shmem_t *s = h_peek(h, O_SHMEM);
+    void *p = s ? s->ptr : NULL;
+    if (s && size) *size = s->size;
+    g_unlock();
+    return p;
 }
 uint64_t hle_system_event_binding(void *ev) {
     uint64_t id = 0;

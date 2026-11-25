@@ -205,6 +205,92 @@ HLE_FORCE("_ZN2nn2pl8IsVrModeEv", "VR mode: no", unsigned, h_pl_IsVr, void) { re
 HLE_FORCE("_ZN2nn2pl11BeginVrModeEv", "enter VR mode (through am); the host does not: stereo vision not permitted", Result, h_pl_BeginVr, void) { LOG("pl::BeginVrMode (the host does not enter VR)"); return 0xd08e; }
 HLE_FORCE("_ZN2nn2pl9EndVrModeEv", "leave VR mode (through am)", void, h_pl_EndVr, void) {}
 
+// ---------- pl:u service (Platform Shared Fonts) ----------
+static uint8_t *g_pl_shmem = NULL;
+static uint32_t g_pl_shmem_h = 0;
+static uint32_t g_pl_offsets[FONT_TYPES];
+static uint32_t g_pl_sizes[FONT_TYPES];
+
+static void init_pl_shmem(void) {
+    if (g_pl_shmem) return;
+    size_t total_size = 0x1100000; // 17 MB
+    g_pl_shmem = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0);
+    if (g_pl_shmem == MAP_FAILED) {
+        LOG("[RED] pl: cannot allocate shared memory");
+        return;
+    }
+    size_t cur_off = 0;
+    size_t skip = font_skip();
+    for (int t = 0; t < FONT_TYPES; t++) {
+        font_t f = font_get(t);
+        if (!f.p || f.n <= 8) {
+            f = font_get(0); // fallback to standard font
+        }
+        if (f.p && f.n > 8) {
+            cur_off = (cur_off + 15) & ~(size_t)15;
+            if (cur_off + f.n <= total_size) {
+                memcpy(g_pl_shmem + cur_off, f.p, f.n);
+                g_pl_offsets[t] = (uint32_t)(cur_off + skip);
+                g_pl_sizes[t] = (uint32_t)(f.n - skip);
+                cur_off += f.n;
+            }
+        }
+    }
+    g_pl_shmem_h = hle_new_shmem(g_pl_shmem, total_size);
+    LOG("pl: shared memory initialized (%zu bytes used of %zu, handle=%#x)", cur_off, total_size, g_pl_shmem_h);
+}
+
+static Result pl_u_answer(sf_req *q) {
+    LOG("sf: pl:u command %u (in_len=%zu)", q->cmd, q->in_len);
+    init_pl_shmem();
+    if (q->cmd == 0) { // RequestLoad
+        return RES_OK;
+    }
+    if (q->cmd == 1) { // GetLoadState
+        q->out_len = 4;
+        *(uint32_t *)q->out = 1; // Loaded
+        return RES_OK;
+    }
+    if (q->cmd == 2) { // GetSize
+        uint32_t type = q->in_len >= 4 ? *(uint32_t *)q->in : 0;
+        if (type >= FONT_TYPES) type = 0;
+        q->out_len = 4;
+        *(uint32_t *)q->out = g_pl_sizes[type];
+        return RES_OK;
+    }
+    if (q->cmd == 3) { // GetSharedMemoryAddressOffset
+        uint32_t type = q->in_len >= 4 ? *(uint32_t *)q->in : 0;
+        if (type >= FONT_TYPES) type = 0;
+        q->out_len = 4;
+        *(uint32_t *)q->out = g_pl_offsets[type];
+        return RES_OK;
+    }
+    if (q->cmd == 4) { // GetSharedMemoryNativeHandle
+        q->out_copy = g_pl_shmem_h;
+        return RES_OK;
+    }
+    if (q->cmd == 5 || q->cmd == 6) { // GetSharedFontInOrderOfPriority / ForSystem
+        q->out_len = 8;
+        q->out[0] = 1; // loaded
+        uint32_t count = FONT_TYPES;
+        *(uint32_t *)(q->out + 4) = count;
+        uint32_t cap0 = (uint32_t)(q->b[0].size / 4);
+        uint32_t cap1 = (uint32_t)(q->b[1].size / 4);
+        uint32_t cap2 = (uint32_t)(q->b[2].size / 4);
+        for (uint32_t i = 0; i < count; i++) {
+            if (q->b[0].p && i < cap0) ((uint32_t *)q->b[0].p)[i] = i;
+            if (q->b[1].p && i < cap1) ((uint32_t *)q->b[1].p)[i] = g_pl_offsets[i];
+            if (q->b[2].p && i < cap2) ((uint32_t *)q->b[2].p)[i] = g_pl_sizes[i];
+        }
+        return RES_OK;
+    }
+    LOG("[RED] sf: pl:u unhandled command %u", q->cmd);
+    return RES_OK;
+}
+static Result pl_s_answer(sf_req *q) { return pl_u_answer(q); }
+SF_SERVICE("pl:u", pl_u_answer);
+SF_SERVICE("pl:s", pl_s_answer);
+
 // ---------- ec: shop applet (the upgrade-to-Switch-2-Edition page) ----------
 // The shop is out of scope: no-op. The game does not look at the return value (both overloads are handled as returning nothing)
 HLE_FORCE("_ZN2nn2ec40ShowShopApplicationInformationForUpgradeENS0_14UpgradeEditionE", "shop upgrade page, out of scope; no-op", void, h_ec_ShowUpg, int ed) { DM_APPLET("shop"); LOG("ec::ShowShopApplicationInformationForUpgrade(%d) (cut)", ed); }

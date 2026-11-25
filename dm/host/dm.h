@@ -118,6 +118,9 @@ void nro_unload_alone(module_t *m); // the end of a load alone (DestroyJitEnviro
 const char *dm_jit_serve_dir(void); uint8_t *dm_jit_layout_base(void);   // a served nn::jit image and the layout the modules are mapped in for it (loader.c, hle_jit.c)
 void nro_unload(module_t *m);   // take an NRO out of the lookups and bind the imports that pointed into it again
 int svc_nro_deactivate(module_t *m);   // mark inactive under the memory map lock, refusing while a stack borrows its data
+uint32_t sf_connect(const char *name);
+void sf_close(uint32_t h);
+uint32_t sf_send_sync(uint32_t h, uint32_t *m, uint64_t size);
 void dm_device_share(const void *p, uint64_t size, int share);   // guest memory a device maps (share 1) or no longer maps (0): Horizon's DeviceShared attribute, which refuses unmapping it (hle_svc.c)
 void *module_sym(module_t *m, const char *name);
 int dm_sdk_major(void);   // SDK major version from the sdk module's version string (loader.c); 0 = unknown
@@ -171,6 +174,8 @@ int hle_signal_bound_system_event(void *g);   // hle_thread.c: signal a service-
 uint64_t hle_system_event_binding(void *g);   // Opaque lifetime ID of a binding, 0 if unbound; a rebind gets a new ID even if its address and handle are reused
 int hle_signal_system_event_binding(uint64_t binding);   // Signal only this binding lifetime (any thread); 0 after its write handle closes
 uint32_t hle_new_event(uint32_t *write_end);   // hle_thread.c: a new kernel event's read end (a service's handle copied to its client); its write end in *write_end, none when NULL (never signaled)
+uint32_t hle_new_shmem(void *ptr, size_t size);
+void *hle_get_shmem(uint32_t h, size_t *size);
 uint32_t hle_dup_readable_handle(uint32_t h);   // hle_thread.c: a second read end of a kernel event (the copy a service hands its client), 0 if h is no read end
 int hle_signal_event_handle(uint32_t write_end);   // hle_thread.c: signal a host-made kernel event by its write end (any thread); 0 once that end is closed
 // Page fault hook / hook before the host writes guest memory (crash.c; used for write-protect dirty page tracking)

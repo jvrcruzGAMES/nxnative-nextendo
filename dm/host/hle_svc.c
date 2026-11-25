@@ -1030,12 +1030,64 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
           if (before >> 28 != after >> 28) LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB)", after / 1073741824.0, APP_POOL / 1073741824.0); }
         regs[0] = 0; return 0;
     }
+    case 0x13: { // MapSharedMemory(handle, addr, size, perm)
+        uint32_t h = (uint32_t)regs[0];
+        uintptr_t addr = (uintptr_t)regs[1];
+        size_t size = (size_t)regs[2];
+        size_t shm_sz = 0;
+        void *shm_ptr = hle_get_shmem(h, &shm_sz);
+        if (!shm_ptr) {
+            LOG("[RED] svcMapSharedMemory: invalid handle %#x", h);
+            regs[0] = 0xe401u;
+            return 0;
+        }
+        vm_address_t to = (vm_address_t)addr;
+        vm_prot_t cur = 0, max = 0;
+        kern_return_t kr = vm_remap(mach_task_self(), &to, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                    mach_task_self(), (vm_address_t)shm_ptr, FALSE, &cur, &max, VM_INHERIT_NONE);
+        if (kr != KERN_SUCCESS || to != (vm_address_t)addr) {
+            LOG("[RED] svcMapSharedMemory: vm_remap failed: %d", kr);
+            regs[0] = 0xdc01u;
+            return 0;
+        }
+        LOG("svcMapSharedMemory: mapped shmem %#x (%zu bytes) -> %p", h, size, (void *)addr);
+        regs[0] = 0;
+        return 0;
+    }
+    case 0x14: { // UnmapSharedMemory
+        regs[0] = 0;
+        return 0;
+    }
     case 0x15: {  // CreateTransferMemory(→w1 handle; x1 address, x2 size, w3 permission): the memory stays where it is in this one address space, and the only receivers are host services
         // (audren:u, hle_audren_sv.c), which read nothing through it. A handle outside the kernel handle table: CloseHandle passes over it. The placeholder answer left the address in w1
         // as the handle, and a CloseHandle of an address whose low word fell in the table would have closed another object
+        extern void hle_record_tmem(uint32_t h, void *addr, size_t size);
         static _Atomic uint32_t next;
         { static int once; if (!once++) LOG("svc CreateTransferMemory %#llx+%#llx: a handle outside the kernel table (host services only)", regs[1], regs[2]); }
-        regs[0] = 0; regs[1] = 0xd1000000u | (atomic_fetch_add(&next, 1) & 0xffffu); return 0;
+        uint32_t h = 0xd1000000u | (atomic_fetch_add(&next, 1) & 0xffffu);
+        hle_record_tmem(h, (void *)regs[1], (size_t)regs[2]);
+        regs[0] = 0; regs[1] = h; return 0;
+    }
+    case 0x16: { // CloseHandle(Handle h)
+        uint32_t h = (uint32_t)regs[0];
+        if (h >= 0xd0000u) sf_close(h);
+        regs[0] = 0; return 0;
+    }
+    case 0x1F: { // ConnectToNamedPort(→w1 handle; x1 name)
+        const char *name = (const char *)regs[1];
+        uint32_t h = sf_connect(name);
+        if (h) {
+            regs[0] = 0; regs[1] = h;
+            return 0;
+        }
+        LOG("[RED] svcConnectToNamedPort on '%s' failed", name);
+        regs[0] = 0xe401u; return 0;
+    }
+    case 0x21: { // SendSyncRequest(Handle h)
+        uint32_t h = (uint32_t)regs[0];
+        uint8_t *tlr = (uint8_t *)pthread_getspecific(g_keytlr);
+        regs[0] = sf_send_sync(h, (uint32_t *)tlr, 0x100);
+        return 0;
     }
     case 0x26: {  // Break(reason, ptr, size): SDK fatal abort
         uint32_t res = (regs[1] && regs[2] >= 4) ? *(uint32_t *)regs[1] : 0;
@@ -1096,4 +1148,18 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (!g_seen[num & 0xff]) { g_seen[num & 0xff] = 1; LOG("SVC %#x x0=%#llx x1=%#llx x2=%#llx (placeholder returns success)", num, regs[0], regs[1], regs[2]); }
         regs[0] = 0; return 0;
     }
+}
+
+static struct { uint32_t h; void *addr; size_t size; } g_tmem[64];
+void hle_record_tmem(uint32_t h, void *addr, size_t size) {
+    unsigned idx = h & 63u;
+    g_tmem[idx].h = h;
+    g_tmem[idx].addr = addr;
+    g_tmem[idx].size = size;
+}
+void *hle_get_tmem(uint32_t h, size_t *size) {
+    unsigned idx = h & 63u;
+    if (g_tmem[idx].h != h) return NULL;
+    if (size) *size = g_tmem[idx].size;
+    return g_tmem[idx].addr;
 }

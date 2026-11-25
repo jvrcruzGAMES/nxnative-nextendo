@@ -83,7 +83,8 @@ def scan(dump):
     if not is_dump(dump): raise Error(f'{dump}: no base/exefs/main.npdm with a RomFS in base/ or updates/<version>/, nor exefs/main.npdm and romfs in the folder or in updates/<version>/')
     vers = updates(dump)
     app = program_id((base_of(dump) or max((p for p in vers.values() if is_version(p)), key=lambda p: int(p.name))) / 'exefs/main.npdm')
-    if app & 0xFFF: raise Error(f'{dump}: base program ID {app:016X} is not a base title ID')
+    is_system = (app >> 12) in (0x0100000000000, 0x0100000000001)
+    if app & 0xFFF and not is_system: raise Error(f'{dump}: base program ID {app:016X} is not a base title ID')
     dlc = {}
     for d in sorted(p for p in (dump / 'dlc').iterdir() if p.is_dir()) if (dump / 'dlc').is_dir() else []:
         try: tid = int(d.name, 16)

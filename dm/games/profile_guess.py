@@ -154,7 +154,7 @@ def guess(F, hooks=None):
     # NVIDIA's OpenGL and Vulkan drivers are never loaded: they program the GPU through NvRm, which the host does not have. Absolum (FNA3D on NVN) imports EGL for SDL3's GL support, never used
     keep, drop = [], []
     for name in sorted((m for m in mods if m != 'rtld'), key=load_order):
-        if name in ('main', 'sdk') or ((imp & mods[name]['exports']) - hooks and mods[name]['kind'] not in GPU_DRIVERS): keep.append(name)
+        if name == 'main' or (name == 'sdk' and (imp & mods['sdk']['exports'])) or ((imp & mods[name]['exports']) - hooks and mods[name]['kind'] not in GPU_DRIVERS): keep.append(name)
         else: drop.append(f'{name} ({mods[name]["kind"]})')
     G['modules'] = (' '.join(keep), f'not loaded, main takes nothing from them the host does not supply: {", ".join(drop)}' if drop else 'every module main imports from')
 

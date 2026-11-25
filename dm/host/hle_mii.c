@@ -17,6 +17,10 @@ uint64_t dm_entropy64(void);
 __attribute__((weak)) int front_mii_editor(void *charinfo_out, int is_new) {
     (void)charinfo_out; (void)is_new; return -1;
 }
+__attribute__((weak)) int front_mii_editor_last_index(void) { return -1; }
+__attribute__((weak)) uint32_t sf_session(const char *name, sf_answer answer, void *ctx, void (*close)(void *ctx)) {
+    (void)name; (void)answer; (void)ctx; (void)close; return 0;
+}
 
 // index ≥ 0: default Mii <index> (a fixed create ID, so a game that saved one finds the same Mii again); < 0: a random Mii (a fresh one)
 static void mii_default(mii_charinfo *c, int gender, int index) {
@@ -70,6 +74,12 @@ static uint16_t mii_crc16(const uint8_t *p, size_t n) {
     return c;
 }
 static unsigned mii_bits(const uint8_t *w, int word, int at, int len) { uint32_t x; memcpy(&x, w + 4 * word, 4); return (x >> at) & ((1u << len) - 1); }
+static void mii_put_bits(uint8_t *w, int word, int at, int len, unsigned val) {
+    uint32_t x; memcpy(&x, w + 4 * word, 4);
+    uint32_t mask = ((1u << len) - 1u) << at;
+    x = (x & ~mask) | ((val & ((1u << len) - 1u)) << at);
+    memcpy(w + 4 * word, &x, 4);
+}
 static void mii_from_store(mii_charinfo *c, const uint8_t *sd) {
     memset(c, 0, sizeof *c);
     memcpy(c->create_id, sd + 0x30, 16); memcpy(c->nickname, sd + 0x1c, 20);
@@ -87,6 +97,31 @@ static void mii_from_store(mii_charinfo *c, const uint8_t *sd) {
     c->eyebrow_scale = mii_bits(sd, 6, 0, 4); c->eyebrow_rotate = mii_bits(sd, 6, 4, 4); c->eyebrow_x = mii_bits(sd, 6, 8, 4); c->eyebrow_y = (uint8_t)(mii_bits(sd, 6, 12, 4) + 3);
     c->nose_scale = mii_bits(sd, 6, 16, 4); c->mouth_scale = mii_bits(sd, 6, 20, 4); c->mustache_scale = mii_bits(sd, 6, 24, 4); c->mole_scale = mii_bits(sd, 6, 28, 4);
 }
+static void mii_to_store(uint8_t *sd, const mii_charinfo *c) {
+    memset(sd, 0, MII_STORE);
+    memcpy(sd + 0x1c, c->nickname, 20);
+    memcpy(sd + 0x30, c->create_id, 16);
+    mii_put_bits(sd, 0, 0, 8, c->hair_type); mii_put_bits(sd, 0, 8, 7, c->height); mii_put_bits(sd, 0, 15, 1, c->mole_type); mii_put_bits(sd, 0, 16, 7, c->build);
+    mii_put_bits(sd, 0, 23, 1, c->hair_flip); mii_put_bits(sd, 0, 24, 7, c->hair_color); mii_put_bits(sd, 0, 31, 1, c->type);
+    mii_put_bits(sd, 1, 0, 7, c->eye_color); mii_put_bits(sd, 1, 7, 1, c->gender); mii_put_bits(sd, 1, 8, 7, c->eyebrow_color); mii_put_bits(sd, 1, 16, 7, c->mouth_color); mii_put_bits(sd, 1, 24, 7, c->beard_color);
+    mii_put_bits(sd, 2, 0, 7, c->glass_color); mii_put_bits(sd, 2, 8, 6, c->eye_type); mii_put_bits(sd, 2, 14, 2, c->region_move); mii_put_bits(sd, 2, 16, 6, c->mouth_type);
+    mii_put_bits(sd, 2, 22, 2, c->font_region); mii_put_bits(sd, 2, 24, 5, c->eye_y); mii_put_bits(sd, 2, 29, 3, c->glass_scale);
+    mii_put_bits(sd, 3, 0, 5, c->eyebrow_type); mii_put_bits(sd, 3, 5, 3, c->mustache_type); mii_put_bits(sd, 3, 8, 5, c->nose_type); mii_put_bits(sd, 3, 13, 3, c->beard_type);
+    mii_put_bits(sd, 3, 16, 5, c->nose_y); mii_put_bits(sd, 3, 21, 3, c->mouth_aspect); mii_put_bits(sd, 3, 24, 5, c->mouth_y); mii_put_bits(sd, 3, 29, 3, c->eyebrow_aspect);
+    mii_put_bits(sd, 4, 0, 5, c->mustache_y); mii_put_bits(sd, 4, 5, 3, c->eye_rotate); mii_put_bits(sd, 4, 8, 5, c->glass_y); mii_put_bits(sd, 4, 13, 3, c->eye_aspect);
+    mii_put_bits(sd, 4, 16, 5, c->mole_x); mii_put_bits(sd, 4, 21, 3, c->eye_scale); mii_put_bits(sd, 4, 24, 5, c->mole_y);
+    mii_put_bits(sd, 5, 0, 5, c->glass_type); mii_put_bits(sd, 5, 8, 4, c->favorite_color); mii_put_bits(sd, 5, 12, 4, c->faceline_type); mii_put_bits(sd, 5, 16, 4, c->faceline_color);
+    mii_put_bits(sd, 5, 20, 4, c->faceline_wrinkle); mii_put_bits(sd, 5, 24, 4, c->faceline_make); mii_put_bits(sd, 5, 28, 4, c->eye_x);
+    unsigned eb_y = c->eyebrow_y >= 3 ? (unsigned)(c->eyebrow_y - 3) : 0;
+    mii_put_bits(sd, 6, 0, 4, c->eyebrow_scale); mii_put_bits(sd, 6, 4, 4, c->eyebrow_rotate); mii_put_bits(sd, 6, 8, 4, c->eyebrow_x); mii_put_bits(sd, 6, 12, 4, eb_y);
+    mii_put_bits(sd, 6, 16, 4, c->nose_scale); mii_put_bits(sd, 6, 20, 4, c->mouth_scale); mii_put_bits(sd, 6, 24, 4, c->mustache_scale); mii_put_bits(sd, 6, 28, 4, c->mole_scale);
+    uint16_t crc = mii_crc16(sd, 0x40);
+    sd[0x40] = (uint8_t)(crc >> 8);
+    sd[0x41] = (uint8_t)(crc & 0xff);
+    uint16_t dcrc = mii_crc16(sd, 0x42);
+    sd[0x42] = (uint8_t)(dcrc >> 8);
+    sd[0x43] = (uint8_t)(dcrc & 0xff);
+}
 // The database the service answers from: the console's Miis (g_mii_own of them), then the Miis made in the host's stand-in for the editor (AppendMii), up to MII_DB_MAX in all
 static mii_charinfo g_mii_db[MII_DB_MAX];
 static int g_mii_n, g_mii_own, g_mii_changed;   // g_mii_changed: a Mii was added since the game last asked IsUpdated about the database
@@ -103,7 +138,19 @@ static int mii_db_parse(const uint8_t *b, size_t size, mii_charinfo *out) {
 // console; the player's console file is never written. The host's own format: "DMMI", the version (1), the count, 2 bytes of zeros, then the CharInfos
 enum { MII_HOST_HEAD = 8 };
 const char *dm_system_dir(char *buf, size_t n);   // hle_fs.c: $DM_SYSTEM_DIR, default $DM_ROOT/run/platform/system
-static int mii_host_path(char *p, size_t n) { char t[1024]; return snprintf(p, n, "%s/host/MiiDatabase.dat", dm_system_dir(t, sizeof t)) < (int)n; }
+static int mii_host_path(char *p, size_t n) {
+    char t[1024];
+    const char *sys = dm_system_dir(t, sizeof t);
+    if (strstr(sys, ".app/")) {
+        const char *root = getenv("DM_ROOT");
+        if (root && *root && !strstr(root, ".app/"))
+            return snprintf(p, n, "%s/system/host/MiiDatabase.dat", root) < (int)n;
+        const char *home = getenv("HOME");
+        if (home && *home)
+            return snprintf(p, n, "%s/Library/Application Support/nxnative/system/host/MiiDatabase.dat", home) < (int)n;
+    }
+    return snprintf(p, n, "%s/host/MiiDatabase.dat", sys) < (int)n;
+}
 // <0: not the host's database; else the Miis read into out (room for max)
 static int mii_host_parse(const uint8_t *b, size_t size, mii_charinfo *out, int max) {
     if (size < MII_HOST_HEAD || memcmp(b, "DMMI", 4) || b[4] != 1) return -1;
@@ -280,13 +327,15 @@ int dm_mii_standin(const char *dir) {
     return ok;
 }
 
-// The Mii editor (MiiEdit library applet). AppendMii opens it to create a Mii: front_mii_editor shows the native
-// UI, and saving adds it to the database and keeps it in the host's file (mii_host_save); *index is its place in the database.
+// The Mii editor (MiiEdit library applet). AppendMii opens it to create a Mii: front_mii_editor launches the
+// real MiiEdit applet when present (returning 2) or shows the host's native UI (returning 1), and saving adds it
+// to the database and keeps it in the host's file (mii_host_save); *index is its place in the database.
 // Headless runs (front_mii_editor returning -1) save the default Mii directly. A full database cancels, as the editor cannot add one then
 HLE_FORCE("_ZN2nn3mii9AppendMiiEPi", "MiiEdit applet; create Mii and add to database", Result, h_mii_Append, int *index) {
     DM_APPLET("Mii editor"); mii_db_once();
     pthread_mutex_lock(&g_mii_mu);
     if (g_mii_n >= MII_DB_MAX) { pthread_mutex_unlock(&g_mii_mu); LOG("mii: AppendMii: the database is full (cancelled)"); return MII_RES_CANCELED; }
+    int old_n = g_mii_n;
     pthread_mutex_unlock(&g_mii_mu);
 
     mii_charinfo new_mii;
@@ -296,6 +345,24 @@ HLE_FORCE("_ZN2nn3mii9AppendMiiEPi", "MiiEdit applet; create Mii and add to data
     if (saved == 0) {
         LOG("mii: AppendMii: cancelled by player");
         return MII_RES_CANCELED;
+    }
+    if (saved == 2) {
+        pthread_mutex_lock(&g_mii_mu);
+        mii_db_load();
+        int new_n = g_mii_n;
+        int i = front_mii_editor_last_index();
+        if (i < 0 || i >= new_n) {
+            i = (new_n > old_n) ? (new_n - 1) : -1;
+        }
+        if (i >= 0) g_mii_changed = 1;
+        pthread_mutex_unlock(&g_mii_mu);
+        if (i < 0) {
+            LOG("mii: AppendMii: MiiEdit applet exited without adding a Mii");
+            return MII_RES_CANCELED;
+        }
+        if (index) *index = i;
+        LOG("mii: AppendMii: MiiEdit applet stored Mii at database entry %d", i);
+        return RES_OK;
     }
 
     pthread_mutex_lock(&g_mii_mu);
@@ -318,7 +385,13 @@ HLE_FORCE("_ZN2nn3mii11ShowMiiEditEv", "MiiEdit applet; show native Mii editor",
         pthread_mutex_unlock(&g_mii_mu);
 
         int saved = front_mii_editor(&edit_mii, 0);
-        if (saved == 1) {
+        if (saved == 2) {
+            pthread_mutex_lock(&g_mii_mu);
+            mii_db_load();
+            g_mii_changed = 1;
+            pthread_mutex_unlock(&g_mii_mu);
+            LOG("mii: ShowMiiEdit: reloaded database after MiiEdit applet (%d Miis)", g_mii_n);
+        } else if (saved == 1) {
             pthread_mutex_lock(&g_mii_mu);
             memcpy(&g_mii_db[target], &edit_mii, sizeof(mii_charinfo));
             g_mii_changed = 1;
@@ -330,8 +403,14 @@ HLE_FORCE("_ZN2nn3mii11ShowMiiEditEv", "MiiEdit applet; show native Mii editor",
         pthread_mutex_unlock(&g_mii_mu);
         mii_charinfo new_mii;
         mii_default(&new_mii, 0, -1);
-        int saved = front_mii_editor(&new_mii, 1);
-        if (saved == 1) {
+        int saved = front_mii_editor(&new_mii, 0);
+        if (saved == 2) {
+            pthread_mutex_lock(&g_mii_mu);
+            mii_db_load();
+            if (g_mii_n > 0) g_mii_changed = 1;
+            pthread_mutex_unlock(&g_mii_mu);
+            LOG("mii: ShowMiiEdit: reloaded database after MiiEdit applet (%d Miis)", g_mii_n);
+        } else if (saved == 1) {
             pthread_mutex_lock(&g_mii_mu);
             if (g_mii_n < MII_DB_MAX) {
                 int i = g_mii_n++;
@@ -345,3 +424,258 @@ HLE_FORCE("_ZN2nn3mii11ShowMiiEditEv", "MiiEdit applet; show native Mii editor",
     }
     return RES_OK;
 }
+
+static int mii_get_store(void *buf, int n, int src, size_t stride) {
+    int k = 0; pthread_mutex_lock(&g_mii_mu);
+    for (int i = 0; (src & MII_SRC_DATABASE) && buf && k < n && i < g_mii_n; i++, k++) {
+        uint8_t *e = (uint8_t *)buf + (size_t)k * stride;
+        mii_to_store(e, &g_mii_db[i]);
+        if (stride > MII_STORE) { uint32_t source = 0; memcpy(e + MII_STORE, &source, 4); }
+    }
+    for (int d = 0; (src & MII_SRC_DEFAULT) && buf && k < n && d < MII_DEFAULTS; d++, k++) {
+        uint8_t *e = (uint8_t *)buf + (size_t)k * stride;
+        mii_charinfo def_c;
+        mii_default(&def_c, d >= 3, d);
+        mii_to_store(e, &def_c);
+        if (stride > MII_STORE) { uint32_t source = 1; memcpy(e + MII_STORE, &source, 4); }
+    }
+    pthread_mutex_unlock(&g_mii_mu); return k;
+}
+
+static Result mii_database_answer(sf_req *q) {
+    LOG("sf: IDatabaseService command %u (%zu data words in, nb=%u, na=%u, nx=%u)", q->cmd, q->in_len / 4, q->nb, q->na, q->nx);
+    mii_db_once();
+    int src_flag = (q->in_len >= 4) ? *(int32_t *)q->in : MII_SRC_DATABASE;
+    if (src_flag == 0) src_flag = MII_SRC_DATABASE;
+    if (q->cmd == 0) { // IsUpdated
+        pthread_mutex_lock(&g_mii_mu);
+        int r = (src_flag & MII_SRC_DATABASE) ? g_mii_changed : 0;
+        if (src_flag & MII_SRC_DATABASE) g_mii_changed = 0;
+        pthread_mutex_unlock(&g_mii_mu);
+        q->out_len = 1;
+        *(uint8_t *)q->out = (uint8_t)r;
+        return RES_OK;
+    }
+    if (q->cmd == 1) { // IsFullDatabase
+        pthread_mutex_lock(&g_mii_mu);
+        uint8_t full = (g_mii_n >= MII_DB_MAX);
+        pthread_mutex_unlock(&g_mii_mu);
+        q->out_len = 1;
+        *(uint8_t *)q->out = full;
+        return RES_OK;
+    }
+    if (q->cmd == 2) { // GetCount(SourceFlag)
+        pthread_mutex_lock(&g_mii_mu);
+        int32_t cnt = (src_flag & MII_SRC_DATABASE ? g_mii_n : 0) + (src_flag & MII_SRC_DEFAULT ? MII_DEFAULTS : 0);
+        pthread_mutex_unlock(&g_mii_mu);
+        q->out_len = 4;
+        *(int32_t *)q->out = cnt;
+        return RES_OK;
+    }
+    if (q->cmd == 3) { // Get (CharInfoElement array, 0x5c each: CharInfo + u32 source)
+        int max_elem = (q->nb > 0 && q->b[0].p) ? (int)(q->b[0].size / (sizeof(mii_charinfo) + 4)) : 0;
+        int count = mii_get(q->nb > 0 ? q->b[0].p : NULL, max_elem, src_flag, sizeof(mii_charinfo) + 4);
+        q->out_len = 4;
+        *(int32_t *)q->out = count;
+        return RES_OK;
+    }
+    if (q->cmd == 4) { // Get1 (CharInfo array, 0x58 each)
+        int max_elem = (q->nb > 0 && q->b[0].p) ? (int)(q->b[0].size / sizeof(mii_charinfo)) : 0;
+        int count = mii_get(q->nb > 0 ? q->b[0].p : NULL, max_elem, src_flag, sizeof(mii_charinfo));
+        q->out_len = 4;
+        *(int32_t *)q->out = count;
+        return RES_OK;
+    }
+    if (q->cmd == 5) { // UpdateLatest(CharInfo, SourceFlag) -> CharInfo
+        if (q->in_len >= sizeof(mii_charinfo)) {
+            mii_charinfo c;
+            memcpy(&c, q->in, sizeof c);
+            int idx = mii_find(c.create_id);
+            if (idx < 0) return MII_RES_NOT_FOUND;
+            pthread_mutex_lock(&g_mii_mu);
+            c = g_mii_db[idx];
+            pthread_mutex_unlock(&g_mii_mu);
+            q->out_len = sizeof c;
+            memcpy(q->out, &c, sizeof c);
+            return RES_OK;
+        }
+        return RES_OK;
+    }
+    if (q->cmd == 6) { // BuildRandom
+        mii_charinfo c;
+        int gender = (q->in_len >= 8) ? *(int32_t *)(q->in + 4) : 0;
+        mii_default(&c, gender, -1);
+        if (q->nb > 0 && q->b[0].p && q->b[0].size >= sizeof(mii_charinfo)) {
+            memcpy(q->b[0].p, &c, sizeof(mii_charinfo));
+        } else {
+            q->out_len = sizeof(mii_charinfo);
+            memcpy(q->out, &c, sizeof(mii_charinfo));
+        }
+        return RES_OK;
+    }
+    if (q->cmd == 7) { // BuildDefault
+        mii_charinfo c;
+        int idx = (q->in_len >= 4) ? *(int32_t *)q->in : 0;
+        mii_default(&c, idx >= 3, idx < 0 || idx >= MII_DEFAULTS ? 0 : idx);
+        if (q->nb > 0 && q->b[0].p && q->b[0].size >= sizeof(mii_charinfo)) {
+            memcpy(q->b[0].p, &c, sizeof(mii_charinfo));
+        } else {
+            q->out_len = sizeof(mii_charinfo);
+            memcpy(q->out, &c, sizeof(mii_charinfo));
+        }
+        return RES_OK;
+    }
+    if (q->cmd == 8) { // Get2 (StoreDataElement array, 0x48 each: StoreData + u32 source)
+        int max_elem = (q->nb > 0 && q->b[0].p) ? (int)(q->b[0].size / (MII_STORE + 4)) : 0;
+        int count = mii_get_store(q->nb > 0 ? q->b[0].p : NULL, max_elem, src_flag, MII_STORE + 4);
+        q->out_len = 4;
+        *(int32_t *)q->out = count;
+        return RES_OK;
+    }
+    if (q->cmd == 9) { // Get3 (StoreData array, 0x44 each)
+        int max_elem = (q->nb > 0 && q->b[0].p) ? (int)(q->b[0].size / MII_STORE) : 0;
+        int count = mii_get_store(q->nb > 0 ? q->b[0].p : NULL, max_elem, src_flag, MII_STORE);
+        q->out_len = 4;
+        *(int32_t *)q->out = count;
+        return RES_OK;
+    }
+    if (q->cmd == 10) { // UpdateLatest1(StoreData, SourceFlag) -> StoreData
+        if (q->in_len >= MII_STORE) {
+            int idx = mii_find(q->in + 0x30);
+            if (idx < 0) return MII_RES_NOT_FOUND;
+            q->out_len = MII_STORE;
+            pthread_mutex_lock(&g_mii_mu);
+            mii_to_store(q->out, &g_mii_db[idx]);
+            pthread_mutex_unlock(&g_mii_mu);
+            return RES_OK;
+        }
+        return MII_RES_NOT_FOUND;
+    }
+    if (q->cmd == 11) { // FindIndex(CreateId, is_special) -> s32
+        int idx = (q->in_len >= 16) ? mii_find(q->in) : -1;
+        q->out_len = 4;
+        *(int32_t *)q->out = idx;
+        return idx < 0 ? MII_RES_NOT_FOUND : RES_OK;
+    }
+    if (q->cmd == 12) { // Move(CreateId, s32 new_index)
+        if (q->in_len >= 20) {
+            int old_idx = mii_find(q->in);
+            int new_idx = *(int32_t *)(q->in + 16);
+            pthread_mutex_lock(&g_mii_mu);
+            if (old_idx >= 0 && new_idx >= 0 && new_idx < g_mii_n && old_idx != new_idx) {
+                mii_charinfo tmp = g_mii_db[old_idx];
+                if (old_idx < new_idx) memmove(&g_mii_db[old_idx], &g_mii_db[old_idx + 1], (size_t)(new_idx - old_idx) * sizeof(mii_charinfo));
+                else memmove(&g_mii_db[new_idx + 1], &g_mii_db[new_idx], (size_t)(old_idx - new_idx) * sizeof(mii_charinfo));
+                g_mii_db[new_idx] = tmp;
+                g_mii_changed = 1;
+                mii_host_save();
+            }
+            pthread_mutex_unlock(&g_mii_mu);
+        }
+        return RES_OK;
+    }
+    if (q->cmd == 13) { // AddOrReplace(StoreData)
+        pthread_mutex_lock(&g_mii_mu);
+        const uint8_t *src = NULL;
+        size_t sz = 0;
+        if (q->na > 0 && q->a[0].p && q->a[0].size >= MII_STORE) { src = q->a[0].p; sz = q->a[0].size; }
+        else if (q->nb > 0 && q->b[0].p && q->b[0].size >= MII_STORE) { src = q->b[0].p; sz = q->b[0].size; }
+        else if (q->in_len >= MII_STORE) { src = q->in; sz = q->in_len; }
+        if (src) {
+            mii_charinfo c;
+            if (sz == sizeof(mii_charinfo)) memcpy(&c, src, sizeof c);
+            else mii_from_store(&c, src);
+            int existing = -1;
+            for (int i = 0; i < g_mii_n; i++) {
+                if (!memcmp(g_mii_db[i].create_id, c.create_id, 16)) { existing = i; break; }
+            }
+            if (existing >= 0) {
+                g_mii_db[existing] = c;
+                g_mii_changed = 1;
+                mii_host_save();
+                LOG("mii: IDatabaseService AddOrReplace: updated Mii at entry %d", existing);
+            } else if (g_mii_n < MII_DB_MAX) {
+                g_mii_db[g_mii_n++] = c;
+                g_mii_changed = 1;
+                mii_host_save();
+                LOG("mii: IDatabaseService AddOrReplace: added Mii at entry %d", g_mii_n - 1);
+            }
+        }
+        pthread_mutex_unlock(&g_mii_mu);
+        return RES_OK;
+    }
+    if (q->cmd == 14) { // Delete(CreateId)
+        if (q->in_len >= 16) {
+            pthread_mutex_lock(&g_mii_mu);
+            for (int i = 0; i < g_mii_n; i++) {
+                if (!memcmp(g_mii_db[i].create_id, q->in, 16)) {
+                    if (i + 1 < g_mii_n) memmove(&g_mii_db[i], &g_mii_db[i + 1], (size_t)(g_mii_n - i - 1) * sizeof(mii_charinfo));
+                    g_mii_n--;
+                    if (i < g_mii_own && g_mii_own > 0) g_mii_own--;
+                    g_mii_changed = 1;
+                    mii_host_save();
+                    LOG("mii: IDatabaseService Delete: removed Mii at entry %d", i);
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_mii_mu);
+        }
+        return RES_OK;
+    }
+    if (q->cmd == 15 || q->cmd == 16 || q->cmd == 17) { // DestroyFile / DeleteFile / Format
+        return RES_OK;
+    }
+    if (q->cmd == 20) { // IsBrokenDatabaseWithClearFlag -> u8
+        q->out_len = 1;
+        *(uint8_t *)q->out = 0;
+        return RES_OK;
+    }
+    if (q->cmd == 21) { // GetIndex(CharInfo) -> s32
+        int idx = (q->in_len >= 16) ? mii_find(q->in) : -1;
+        q->out_len = 4;
+        *(int32_t *)q->out = idx;
+        return idx < 0 ? MII_RES_NOT_FOUND : RES_OK;
+    }
+    if (q->cmd == 22) { // SetInterfaceVersion(u32)
+        return RES_OK;
+    }
+    return RES_OK;
+}
+
+static Result mii_static_answer(sf_req *q) {
+    LOG("sf: mii:e/u command %u (%zu data words in)", q->cmd, q->in_len / 4);
+    if (q->cmd == 0) { // GetDatabaseService
+        mii_db_once();
+        q->out_move = sf_session("IDatabaseService", mii_database_answer, NULL, NULL);
+        return RES_OK;
+    }
+    return RES_OK;
+}
+static Result mii_e_answer(sf_req *q) { return mii_static_answer(q); }
+static Result mii_u_answer(sf_req *q) { return mii_static_answer(q); }
+SF_SERVICE("mii:e", mii_e_answer);
+SF_SERVICE("mii:u", mii_u_answer);
+
+static Result miiimg_answer(sf_req *q) {
+    LOG("sf: miiimg command %u (%zu data words in, nb=%u)", q->cmd, q->in_len / 4, q->nb);
+    if (q->cmd == 0) return RES_OK; // Initialize
+    if (q->cmd == 10) return RES_OK; // Reload
+    if (q->cmd == 11) { // GetCount
+        q->out_len = 4;
+        *(uint32_t *)q->out = 0;
+        return RES_OK;
+    }
+    if (q->cmd == 12) { // IsEmpty
+        q->out_len = 1;
+        *(uint8_t *)q->out = 1;
+        return RES_OK;
+    }
+    if (q->cmd == 13) { // IsFull
+        q->out_len = 1;
+        *(uint8_t *)q->out = 0;
+        return RES_OK;
+    }
+    return RES_OK;
+}
+SF_SERVICE("miiimg", miiimg_answer);
+

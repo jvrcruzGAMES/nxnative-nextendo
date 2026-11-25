@@ -64,4 +64,6 @@ HLE_FORCE("_ZN2nn7friends29DeclareCloseOnlinePlaySessionERKNS_7account3UidE", "o
 // Presence
 HLE_FORCE("_ZN2nn7friends12UserPresence10InitializeERKNS_7account3UidE", "presence", Result, h_fr_UpInit, void *self, const void *uid) { (void)self; (void)uid; return nextendo_enabled() ? RES_OK : RES_FAIL; }
 HLE_FORCE("_ZN2nn7friends12UserPresence14SetDescriptionEPKc", "presence", Result, h_fr_UpDesc, void *self, const char *s) { (void)self; (void)s; return nextendo_enabled() ? RES_OK : RES_FAIL; }
+HLE_FORCE("_ZN2nn7friends12UserPresence11SetAppValueEPKcS3_", "presence app value", Result, h_fr_UpSetAppVal, void *self, const char *k, const char *v) { (void)self; (void)k; (void)v; return nextendo_enabled() ? RES_OK : RES_FAIL; }
+HLE_FORCE("_ZN2nn7friends12UserPresence5ClearEv", "presence clear", Result, h_fr_UpClear, void *self) { (void)self; return nextendo_enabled() ? RES_OK : RES_FAIL; }
 HLE_FORCE("_ZN2nn7friends12UserPresence6CommitEv", "presence", Result, h_fr_UpCommit, void *self) { (void)self; return nextendo_enabled() ? RES_OK : RES_FAIL; }
