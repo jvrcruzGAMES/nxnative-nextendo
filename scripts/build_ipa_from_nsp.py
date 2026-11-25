@@ -3463,6 +3463,7 @@ def parse_args(argv):
     ap.add_argument('--no-heap-check', action='store_true', help='a provisional profile: skip the heap check and the address region check on the Mac (the alias / heap split stays a guess); a derived profile: skip the address region check')
     ap.add_argument('--progress', choices=('auto', 'bar', 'lines', 'json', 'off'), help='stage lines on the console: bar = one line per stage, redrawn in place; lines = a plain line every BEAT seconds; json = newline-delimited JSON events (no prompts); off = only each stage\'s start and end '
                     '(default: the PROGRESS setting; auto = bar in a terminal or Spyder, lines when the output goes to a file or a pipe)')
+    ap.add_argument('--nxshare', action='store_true', help=argparse.SUPPRESS)
     return ap.parse_args(argv)
 
 
@@ -3643,6 +3644,87 @@ def reconcile_provisional_marker(g, rom):
     return type(g)(g.dir)
 
 
+def pack_nxshare_zip(out_zip, slim_ipa, info_path, romfs_path, icon, aoc, say):
+    import zipfile
+    info = json.loads(info_path.read_text())
+    doc_entries = []   # (src_path, rel_path_under_Documents)
+    def add_tree(src, dst_rel):
+        if src.is_file():
+            doc_entries.append((src, dst_rel))
+        elif src.is_dir():
+            for p in sorted(src.rglob('*')):
+                if p.is_file() and not p.name.startswith('._') and p.name != '.DS_Store':
+                    doc_entries.append((p, f'{dst_rel}/{p.relative_to(src).as_posix()}'))
+
+    if romfs_path.is_file():
+        doc_entries.append((romfs_path, 'romfs.img'))
+    elif romfs_path.is_dir():
+        add_tree(romfs_path, 'romfs')
+
+    msl_path = Path(info['mslPath'])
+    msl_dir = info['mslDir']
+    if msl_path.is_file():
+        doc_entries.append((msl_path, f'msl/{msl_path.name}'))
+    elif msl_path.is_dir():
+        add_tree(msl_path, f'msl/{msl_dir}')
+
+    if aoc and Path(aoc).is_dir():
+        add_tree(Path(aoc), 'aoc')
+    if info.get('pso') and Path(info['pso']).is_dir():
+        add_tree(Path(info['pso']), 'pso')
+
+    rom_parent = romfs_path.parent
+    for extra in ('html', 'jit', 'romfs_programs'):
+        if (rom_parent / extra).is_dir():
+            add_tree(rom_parent / extra, extra)
+
+    files_meta = [{'path': rel, 'size': src.stat().st_size} for src, rel in doc_entries]
+    doc_total = sum(f['size'] for f in files_meta)
+    ipa_size = slim_ipa.stat().st_size
+
+    icon_jpg = None
+    tmp_icon = None
+    if icon and Path(icon).is_file():
+        ip = Path(icon)
+        if ip.suffix.lower() in ('.jpg', '.jpeg'):
+            icon_jpg = ip
+        else:
+            tmp_icon = slim_ipa.parent / 'nxshare_icon.jpg'
+            subprocess.run(['sips', '-s', 'format', 'jpeg', str(ip), '--out', str(tmp_icon)], check=True, capture_output=True)
+            icon_jpg = tmp_icon
+
+    manifest = {
+        'titleId': info['titleId'],
+        'name': info['name'],
+        'version': info['version'],
+        'bundleId': info['bundleId'],
+        'ipaFile': 'main.ipa',
+        'ipaSize': ipa_size,
+        'gfxApi': info['gfxApi'],
+        'mslDir': msl_dir,
+        'documentsSize': doc_total,
+        'files': files_meta,
+    }
+    if icon_jpg:
+        manifest['iconFile'] = 'icon.jpg'
+
+    partial = out_zip.with_name(out_zip.name + '.partial')
+    if partial.exists(): partial.unlink()
+    say(f'packing nxshare bundle → {out_zip} ({len(doc_entries)} Documents files, {doc_total / 2**30:.2f} GB)')
+    try:
+        with zipfile.ZipFile(partial, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+            zf.write(slim_ipa, 'main.ipa')
+            zf.writestr('manifest.json', json.dumps(manifest, indent=2) + '\n')
+            if icon_jpg:
+                zf.write(icon_jpg, 'icon.jpg')
+            for src, rel in doc_entries:
+                zf.write(src, f'Documents/{rel}')
+        partial.replace(out_zip)
+    finally:
+        if tmp_icon and tmp_icon.exists(): tmp_icon.unlink()
+        if partial.exists(): partial.unlink()
+
+
 def main(args=None):
     with contextlib.ExitStack() as cleanup:
         return _main(args, cleanup)
@@ -3675,6 +3757,8 @@ def _main(args, cleanup):
     if prepare_xcode and not keep: raise BuildError('--prepare-xcode requires --keep-extracted: Xcode builds from the extracted files')
     if args.xcode_workspace and not prepare_xcode: raise BuildError('--xcode-workspace requires --prepare-xcode')
     romfs_mode = args.romfs or ROMFS
+    nxshare = getattr(args, 'nxshare', False)
+    if nxshare and (mac or prepare_xcode): raise BuildError(f'--nxshare cannot be combined with {"--platform " + platform if mac else "--prepare-xcode"}')
     if romfs_mode not in ('bundle', 'separate'): raise BuildError(f'ROMFS / --romfs must be bundle or separate: {romfs_mode}')
     if romfs_mode == 'separate' and mac: raise BuildError(f'--romfs separate keeps the game files off the iPhone app: it cannot be combined with --platform {platform}, which runs from the extracted files')
     if romfs_mode == 'separate' and not keep: raise BuildError('--romfs separate requires --keep-extracted: the image must remain available for the one-time transfer to the phone')
@@ -4062,11 +4146,27 @@ def _main(args, cleanup):
         say('choose the game scheme in Xcode, select your Team and iPhone or iPad, then Run (Release)')
         report_profile_status(g, reg, pkg_ver, derived, provisional, 'Xcode project', patched)
         return
-    watch = IpaWatch(repo, work / 'ipa', out_ipa)
+    if nxshare:
+        out_zip = out_ipa if (args.out or OUT_IPA) else out_ipa.with_suffix('.zip')
+        slim_ipa = work / 'ipa/main.ipa'
+        ipa_env['DM_NXSHARE'] = 'YES'
+        ipa_env['DM_COPY_ROMFS'] = 'NO'
+    watch = IpaWatch(repo, work / 'ipa', slim_ipa if nxshare else out_ipa)
     PROG.stage('app build', poll=watch.poll, step='starting')   # build_ipa.sh's "pack IPA" line starts the stage "IPA pack"
     xcode_data = work / 'ipa/build/ios/pkg/dd'   # one file between builds (tree_tar.py); the app in it goes into the IPA, so it is packed after
     tree_tar.unpack(xcode_data, say)
-    run(['bash', repo / 'dm/ios/tools/build_ipa.sh', out_ipa], logs / 'build_ipa.log', env=ipa_env, on_line=watch.line)
+    run(['bash', repo / 'dm/ios/tools/build_ipa.sh', slim_ipa if nxshare else out_ipa], logs / 'build_ipa.log', env=ipa_env, on_line=watch.line)
+    if nxshare:
+        if not slim_ipa.is_file(): raise BuildError(f'no IPA at {slim_ipa}')
+        pack_nxshare_zip(out_zip, slim_ipa, work / 'ipa/build/ios/pkg/nxshare_info.json', Path(romfs), icon, aoc, say)
+        tree_tar.pack(xcode_data, say)
+        PROG.end(f'{out_zip.name}, {amount(out_zip.stat().st_size, "B")}')
+        rmtree(work / 'tmp')
+        if not keep:
+            for d in [ex] + [r['ex'] for r in programs.values()]: say(f'deleting the extracted game files: {d}'); rmtree(d)
+        say(f'done: {out_zip} ({out_zip.stat().st_size / 2**30:.1f} GB)')
+        report_profile_status(g, reg, pkg_ver, derived, provisional, patched=patched)
+        return
     if not out_ipa.is_file(): raise BuildError(f'no IPA at {out_ipa}')
     tree_tar.pack(xcode_data, say)
     PROG.end(f'{out_ipa.name}, {amount(out_ipa.stat().st_size, "B")}')

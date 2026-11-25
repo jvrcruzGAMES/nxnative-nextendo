@@ -48,7 +48,7 @@ NACP=$W/data/v0/control.nacp; [ -f "$NACP" ] || NACP=$(dirname "$ROMFS")/control
 VNACP=$(dirname "$ROMFS")/control.nacp; [ -f "$VNACP" ] || VNACP=$W/data/v0/control.nacp
 [ -n "${DM_APP_VERSION:-}" ] || DM_APP_VERSION=$("${DM_PYTHON:-python3}" "$DM/tools/nacp.py" --version "$VNACP") || { t "no display version in $VNACP: the app version is 1.0"; DM_APP_VERSION=1.0; }
 VNACP=${CONTROL:-$VNACP}   # from here on, the file that lists the game's languages for the launcher's settings
-export LC_ALL=C DM_BUNDLE_ID=${DM_BUNDLE_ID:-org.nxnative.$(echo "$GAME" | tr 'A-Z' 'a-z')} DM_DISPLAY_NAME DM_APP_VERSION DM_APP_CATEGORY=$(gp app_category) DM_TEAM_ID=${DM_TEAM_ID:-0000000000}   # placeholder identity: unsigned, the install tool replaces it
+export LC_ALL=C DM_BUNDLE_ID=${DM_BUNDLE_ID:-org.nxnative.$(echo "$GAME" | tr 'A-Z' 'a-z')} DM_DISPLAY_NAME DM_APP_VERSION DM_APP_CATEGORY=$(gp app_category) DM_TEAM_ID=${DM_TEAM_ID:-0000000000} DM_TITLE_ID=$GAME DM_NXSHARE=${DM_NXSHARE:-NO}   # placeholder identity: unsigned, the install tool replaces it
 if [ "${DM_SHOW_FPS:-0}" = 1 ]; then export DM_SHOW_FPS=YES; else export DM_SHOW_FPS=NO; fi
 export DM_LANG=${DM_LANG:-en-US}
 if [ "$PREPARE_XCODE" = YES ]; then
@@ -288,6 +288,9 @@ if [ -n "${PROGRAMS_TSV:-}" ]; then   # each program's shader libraries, RomFS, 
   done < <(prog_rows); prog_back
 else
 MAPS=()
+if [ "$DM_NXSHARE" = YES ]; then
+  DM_COPY_ROMFS=NO
+fi
 if [ "${DM_COPY_ROMFS:-YES}" = NO ]; then
   t "no game files in the IPA (DM_COPY_ROMFS=NO): the app takes Documents/romfs.img (scripts/push_romfs.sh)"
   # The image's identity (dm/host/romfs_identity.h) goes into the app as romfs.id: main.m then uses only a Documents/romfs.img with the same size and index hash, and says so when it is another version or missing.
@@ -297,6 +300,19 @@ if [ "${DM_COPY_ROMFS:-YES}" = NO ]; then
     MAPS=("$P/romfs.id=$O/romfs.id"); t "game files identity: $(cat "$O/romfs.id")"
   fi
 elif [ -f "$ROMFS" ]; then MAPS=("$P/romfs.img=$ROMFS"); else MAPS=("$P/romfs=$ROMFS"); fi
+if [ "$DM_NXSHARE" = YES ]; then
+  MAPS+=("$P=$APP")
+  mkdir -p "$O"
+  "${DM_PYTHON:-python3}" -c '
+import json, sys
+info = {
+    "titleId": sys.argv[1], "name": sys.argv[2], "version": sys.argv[3], "bundleId": sys.argv[4],
+    "gfxApi": sys.argv[5], "mslDir": sys.argv[6], "mslPath": sys.argv[7],
+    "romfs": sys.argv[8], "aoc": sys.argv[9], "pso": sys.argv[10],
+}
+with open(sys.argv[11], "w") as f: json.dump(info, f, indent=2)
+' "$GAME" "$DM_DISPLAY_NAME" "$DM_APP_VERSION" "$DM_BUNDLE_ID" "$GFXAPI" "$MSLDIR" "$(lib_path "$MSL_IOS/$MSLDIR")" "$ROMFS" "${AOC:-}" "${PSO:-}" "$O/nxshare_info.json" || die "nxshare_info.json"
+else
 if [ -n "$AOC" ] && [ -d "$AOC" ]; then MAPS+=("$P/aoc=$AOC"); t "add-on content: $(ls "$AOC" | tr '\n' ' ')"; fi
 if [ -n "${PSO:-}" ]; then MAPS+=("$P/pso=$PSO"); fi
 MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "$P=$APP")
@@ -304,6 +320,7 @@ MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "$P=$APP")
   if [ -d "$(dirname "$ROMFS")/jit" ]; then MAPS+=("$P/jit=$(dirname "$ROMFS")/jit"); t "nn::jit image: $(dirname "$ROMFS")/jit"; fi
   # the RomFS of the application's other programs (scripts/pack_nup.py: a Switch 2 Edition's Switch 1 program), which the game mounts by program index; in the app also with DM_COPY_ROMFS=NO (main.m)
   if [ -d "$(dirname "$ROMFS")/romfs_programs" ]; then MAPS+=("$P/romfs_programs=$(dirname "$ROMFS")/romfs_programs"); t "other programs' RomFS: $(ls "$(dirname "$ROMFS")/romfs_programs" | grep '\.img$' | tr '\n' ' ')"; fi
+fi
 fi
 t "pack IPA (already-compressed game files stored, everything else deflated)"
 # The device can enable Metal 4/prebuild at run time even when the profile defaults it off. Without an offline archive, its prebuild needs these pulling vertex libraries just as the hybrid pipelines do.

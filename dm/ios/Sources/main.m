@@ -105,6 +105,30 @@ static void aoc_locate(void) {
 static char g_boot_message[640];
 const char *front_ios_boot_message(void) { return g_boot_message[0] ? g_boot_message : NULL; }
 
+static int g_nxshare_needed;
+int front_ios_nxshare_needed(void) { return g_nxshare_needed; }
+
+static NSString *msl_locate(NSString *prog) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+    NSString *res = NSBundle.mainBundle.resourcePath;
+    NSString *docMsl = prog ? [[doc stringByAppendingPathComponent:@"msl"] stringByAppendingPathComponent:prog] : [doc stringByAppendingPathComponent:@"msl"];
+    NSArray *items = [fm contentsOfDirectoryAtPath:docMsl error:nil];
+    if (items.count > 0) return docMsl;
+    return prog ? [[res stringByAppendingPathComponent:@"msl"] stringByAppendingPathComponent:prog] : [res stringByAppendingPathComponent:@"msl"];
+}
+
+static NSString *pso_locate(void) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+    NSString *res = NSBundle.mainBundle.resourcePath;
+    for (NSString *d in @[[doc stringByAppendingPathComponent:@"pso"], [res stringByAppendingPathComponent:@"pso"]]) {
+        BOOL dir = NO;
+        if ([fm fileExistsAtPath:d isDirectory:&dir] && dir && [fm contentsOfDirectoryAtPath:d error:nil].count > 0) return d;
+    }
+    return nil;
+}
+
 static bool g_hud_enabled_from_saved_choice;
 bool front_ios_hud_enabled_from_saved_choice(void) { return g_hud_enabled_from_saved_choice; }
 
@@ -137,14 +161,18 @@ static int boot_env(void) {
     NSString *res = NSBundle.mainBundle.resourcePath;
     for (NSString *d in @[@"save", @"temp"]) [fm createDirectoryAtPath:[doc stringByAppendingPathComponent:d] withIntermediateDirectories:YES attributes:nil error:nil];
     // Keep game files and scratch data out of device backups (Documents is backed up by default; a RomFS placed there is many GB). Saves, logs and the pipeline list stay in the backup
-    for (NSString *d in [@[@"romfs", @"aoc", @"temp"] arrayByAddingObjectsFromArray:[romfs_document_images(doc) valueForKey:@"lastPathComponent"]]) {
+    for (NSString *d in [@[@"romfs", @"aoc", @"msl", @"pso", @"romfs_programs", @"html", @"jit", @"temp"] arrayByAddingObjectsFromArray:[romfs_document_images(doc) valueForKey:@"lastPathComponent"]]) {
         NSURL *u = [NSURL fileURLWithPath:[doc stringByAppendingPathComponent:d]]; NSError *e = nil;
         if ([fm fileExistsAtPath:u.path] && ![u setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:&e]) fprintf(stderr, "boot: %s could not be excluded from backup: %s\n", d.UTF8String, e.localizedDescription.UTF8String);
     }
     // Log: the host only writes to stderr; redirect it to Documents/log.txt (the previous one is kept as log.prev.txt), retrieve it from the Files app when something goes wrong
-    NSString *log = [doc stringByAppendingPathComponent:@"log.txt"], *prev = [doc stringByAppendingPathComponent:@"log.prev.txt"];
-    [fm removeItemAtPath:prev error:nil]; [fm moveItemAtPath:log toPath:prev error:nil];
-    if (freopen(log.fileSystemRepresentation, "w", stderr)) setvbuf(stderr, NULL, _IOLBF, 0);
+    static int log_opened;
+    if (!log_opened) {
+        log_opened = 1;
+        NSString *log = [doc stringByAppendingPathComponent:@"log.txt"], *prev = [doc stringByAppendingPathComponent:@"log.prev.txt"];
+        [fm removeItemAtPath:prev error:nil]; [fm moveItemAtPath:log toPath:prev error:nil];
+        if (freopen(log.fileSystemRepresentation, "w", stderr)) setvbuf(stderr, NULL, _IOLBF, 0);
+    }
     // Environment switch files (for on-device diagnostics: a sideloaded app cannot be given environment variables from outside): one KEY=VALUE per line, # starts a comment; Documents/env.txt takes precedence over dm/env.txt in the bundle (put there by build_ipa.sh's DM_ENV_FILE)
     NSMutableArray<NSString *> *from_file = [NSMutableArray array], *from_launch = [NSMutableArray array];
     for (char **e = environ; *e; e++) {   // set at launch (Xcode, devicectl): before the env files, and the launcher keeps them
@@ -192,7 +220,21 @@ static int boot_env(void) {
     if (!getenv("DM_LANG") && [lang isKindOfClass:NSString.class] && lang.length) setenv("DM_LANG", lang.UTF8String, 0);
     fprintf(stderr, "boot: game language %s\n", getenv("DM_LANG") ?: "en-US");
     NSString *dm = program_env();
-    if (!dm) { romfs_identity_report(doc); fprintf(stderr, "boot: game files not found (Documents/romfs.img, Documents/romfs or <App>/romfs)\n"); return 0; }
+    id nxshareFlag = [NSBundle.mainBundle objectForInfoDictionaryKey:@"DMNxShare"];
+    BOOL isNxShare = [nxshareFlag isKindOfClass:NSNumber.class] ? [nxshareFlag boolValue] : ([nxshareFlag isKindOfClass:NSString.class] && [[nxshareFlag uppercaseString] isEqualToString:@"YES"]);
+    if (!dm) {
+        if (isNxShare) g_nxshare_needed = 1;
+        romfs_identity_report(doc);
+        fprintf(stderr, "boot: game files not found (Documents/romfs.img, Documents/romfs or <App>/romfs)\n");
+        return 0;
+    }
+    const char *mslDir = getenv("DM_MSL_DIR");
+    if (isNxShare && (!mslDir || [fm contentsOfDirectoryAtPath:@(mslDir) error:nil].count == 0)) {
+        g_nxshare_needed = 1;
+        fprintf(stderr, "boot: shader libraries not found yet (nxshare download required)\n");
+        return 0;
+    }
+    g_nxshare_needed = 0;
     setenv("DM_SAVE", [doc stringByAppendingPathComponent:@"save"].fileSystemRepresentation, 0);
     setenv("DM_TEMP", [doc stringByAppendingPathComponent:@"temp"].fileSystemRepresentation, 0);
     setenv("DM_ALBUM_DIR", [doc stringByAppendingPathComponent:@"album"].fileSystemRepresentation, 0);   // local album screenshots (hle_album.c), visible in Files; created lazily on first save
@@ -227,8 +269,8 @@ static int boot_env(void) {
     setenv("DM_GUEST_FILE_DIR", NSTemporaryDirectory().fileSystemRepresentation, 0);   // DM_GUEST_FILE (hle_svc.c) keeps the guest's memory in files there
     setenv("DM_FONT_DIR", [[res stringByAppendingPathComponent:@"dm"] stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path
     aoc_locate();   // add-on content: Documents/aoc, else <App>/aoc; an empty Documents/aoc explicitly selects no DLC
-    NSString *pso = [res stringByAppendingPathComponent:@"pso"];   // the pipeline archive made offline (build_ipa.sh, dm/gfx/tools/pso_offline.py): the shader pairs' bases, which the device then does not build
-    if ([fm fileExistsAtPath:pso]) setenv("DM_PSO_BUNDLE", pso.fileSystemRepresentation, 0);
+    NSString *pso = pso_locate();   // the pipeline archive made offline (Documents/pso, else <App>/pso)
+    if (pso) setenv("DM_PSO_BUNDLE", pso.fileSystemRepresentation, 0);
     chdir(doc.fileSystemRepresentation);
     g_argv[0] = strdup("dmhost"); g_argv[1] = strdup(dm.fileSystemRepresentation); g_argc = 2;
     dm_host_preload_start(g_argc, g_argv);   // Module tables / relocation / takeover run early in the background, in parallel with UIKit startup (and the launcher: the settings it sets are read when the game starts)
@@ -243,7 +285,7 @@ static int boot_env(void) {
 static NSString *program_env(void) {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0], *res = NSBundle.mainBundle.resourcePath;
-    NSString *dmdir = [res stringByAppendingPathComponent:@"dm"], *msl = [res stringByAppendingPathComponent:@"msl"], *prog = nil;
+    NSString *dmdir = [res stringByAppendingPathComponent:@"dm"], *msl = nil, *prog = nil;
     NSString *plist = [NSString stringWithContentsOfFile:[dmdir stringByAppendingPathComponent:@"programs.txt"] encoding:NSUTF8StringEncoding error:nil];
     if (plist) {
         NSArray *have = [plist componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
@@ -257,17 +299,19 @@ static NSString *program_env(void) {
         setenv("DM_PROGRAM", [NSString stringWithFormat:@"%d", n].UTF8String, 1);
         setenv("DM_EMBED_TAG", prog.UTF8String, 1);
         setenv("DM_EXEC_OUT", rec.fileSystemRepresentation, 0);
-        dmdir = [dmdir stringByAppendingPathComponent:prog]; msl = [msl stringByAppendingPathComponent:prog];
+        dmdir = [dmdir stringByAppendingPathComponent:prog];
         setenv("DM_APP_DM", dmdir.fileSystemRepresentation, 1);   // the launcher's settings (Launcher.swift)
         fprintf(stderr, "boot: program %d of %s (%zu bytes of launch parameter)\n", n, [[plist stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] stringByReplacingOccurrencesOfString:@"\n" withString:@" "].UTF8String, d.length > 4 ? (size_t)d.length - 4 : 0);
     }
+    msl = msl_locate(prog);
     NSString *romfs = romfs_locate(prog);
     if (!romfs) return nil;
     fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
     setenv("DM_ROMFS", romfs.fileSystemRepresentation, 0);
-    // The RomFS of the application's other programs (scripts/pack_nup.py, a Switch 2 Edition's Switch 1 program), which the game mounts by program index (hle_fs.c): in the app beside its
-    // RomFS, also when that RomFS is Documents/romfs.img
-    NSString *sib = [(prog ? [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:prog] : NSBundle.mainBundle.resourcePath) stringByAppendingPathComponent:@"romfs_programs"];
+    // The RomFS of the application's other programs (scripts/pack_nup.py, a Switch 2 Edition's Switch 1 program), which the game mounts by program index (hle_fs.c): in Documents or the app
+    NSString *docSib = [(prog ? [doc stringByAppendingPathComponent:prog] : doc) stringByAppendingPathComponent:@"romfs_programs"];
+    NSString *resSib = [(prog ? [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:prog] : NSBundle.mainBundle.resourcePath) stringByAppendingPathComponent:@"romfs_programs"];
+    NSString *sib = [fm fileExistsAtPath:docSib] ? docSib : resSib;
     if ([fm fileExistsAtPath:sib]) setenv("DM_ROMFS_PROGRAMS", sib.fileSystemRepresentation, 0);
     setenv("DM_NVN_SHMAP", [dmdir stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 0);
     setenv("DM_MSL_DIR", msl.fileSystemRepresentation, 0);
@@ -291,6 +335,7 @@ void front_ios_boot(void) {   // Called by front_ios.m once the window and Metal
     pthread_t t; pthread_create(&t, &a, boot_thread, NULL); pthread_detach(t);
 }
 int front_ios_boot_ok(void) { return g_boot_ok; }
+int front_ios_reload_boot_env(void) { g_boot_ok = boot_env(); return g_boot_ok; }
 
 @interface App : UIResponder <UIApplicationDelegate>
 @end
