@@ -7,6 +7,7 @@ import UIKit
 private struct NxShareFile: Decodable {
     let path: String
     let size: Int64
+    let uncompressedSize: Int64?
     let url: String
 }
 
@@ -250,6 +251,8 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
     private var activeFileDestination: URL?
     private var activeFileExpectedSize: Int64 = 0
     private var activeIsArchive: Bool = false
+    private var activeIsPerFileLZMA: Bool = false
+    private var activeFinalDestination: URL?
     private var pendingFiles: [NxShareFile] = []
     private var onComplete: (() -> Void)?
 
@@ -358,9 +361,11 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
 
         if manifest.nxshareVersion == 2, let archive = manifest.archive {
             activeIsArchive = true
+            activeIsPerFileLZMA = false
             pendingFiles = [archive]
         } else {
             activeIsArchive = false
+            activeIsPerFileLZMA = (manifest.nxshareVersion == 3)
             pendingFiles = manifest.files ?? []
         }
         downloadNextFile()
@@ -380,15 +385,19 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
         }
 
         let file = pendingFiles.removeFirst()
+        let finalDest = documentsDirectory().appendingPathComponent(file.path)
         let dest = activeIsArchive
             ? FileManager.default.temporaryDirectory.appendingPathComponent("Documents.archive")
-            : documentsDirectory().appendingPathComponent(file.path)
+            : activeIsPerFileLZMA
+            ? FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".xz")
+            : finalDest
         let fm = FileManager.default
 
+        let expectedOnDisk = activeIsPerFileLZMA ? (file.uncompressedSize ?? file.size) : file.size
         if !activeIsArchive,
-           let attrs = try? fm.attributesOfItem(atPath: dest.path),
+           let attrs = try? fm.attributesOfItem(atPath: finalDest.path),
            let existingSize = attrs[.size] as? Int64,
-           existingSize == file.size {
+           existingSize == expectedOnDisk {
             DispatchQueue.main.async {
                 self.currentFileIndex += 1
                 self.completedBytesBeforeCurrent += file.size
@@ -410,6 +419,7 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
             self.currentFileIndex += 1
             self.currentFileName = file.path
             self.activeFileDestination = dest
+            self.activeFinalDestination = finalDest
             self.activeFileExpectedSize = file.size
         }
 
@@ -458,6 +468,49 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
         }
     }
 
+    private func decompressSingleFile(from xzURL: URL, to finalURL: URL, compressedSize: Int64) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fm = FileManager.default
+            defer { try? fm.removeItem(at: xzURL) }
+            do {
+                try fm.createDirectory(at: finalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if fm.fileExists(atPath: finalURL.path) {
+                    try fm.removeItem(at: finalURL)
+                }
+                fm.createFile(atPath: finalURL.path, contents: nil)
+                let outFH = try FileHandle(forWritingTo: finalURL)
+                defer { try? outFH.close() }
+                let filter = try OutputFilter(.decompress, using: .lzma) { (data: Data?) in
+                    if let data, !data.isEmpty {
+                        try outFH.write(contentsOf: data)
+                    }
+                }
+                let inFH = try FileHandle(forReadingFrom: xzURL)
+                defer { try? inFH.close() }
+                while true {
+                    let chunk = try inFH.read(upToCount: 1024 * 1024) ?? Data()
+                    if chunk.isEmpty { break }
+                    try filter.write(chunk)
+                }
+                try filter.finalize()
+                try outFH.close()
+                var values = URLResourceValues()
+                values.isExcludedFromBackup = true
+                var mutableDest = finalURL
+                try? mutableDest.setResourceValues(values)
+                DispatchQueue.main.async {
+                    self.completedBytesBeforeCurrent += compressedSize
+                    self.downloadedBytes = self.completedBytesBeforeCurrent
+                    self.downloadNextFile()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.phase = .failed("Failed to decompress \(finalURL.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         DispatchQueue.main.async {
             self.downloadedBytes = self.completedBytesBeforeCurrent + totalBytesWritten
@@ -474,6 +527,10 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
             try fm.moveItem(at: location, to: dest)
             if activeIsArchive {
                 decompressArchive(at: dest)
+                return
+            }
+            if activeIsPerFileLZMA, let finalDest = activeFinalDestination {
+                decompressSingleFile(from: dest, to: finalDest, compressedSize: activeFileExpectedSize)
                 return
             }
             var values = URLResourceValues()
