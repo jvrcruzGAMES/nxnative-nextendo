@@ -337,9 +337,11 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     return 1;
 }
 static void fl_add(const uint8_t *a, uint64_t n); static void fl_drop(const uint8_t *a, uint64_t n);   // flushed ranges, see nvn_flushed
+static void ft_drop_pool(const void *pool);
 NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
     // Dead to the replay first (its IDs marked gone under g_rmu, the magic cleared), then torn down: a texture resolving on the submit thread must not find the page table or the storage already gone
     pool_t *o = (pool_t *)p;
+    ft_drop_pool(p);
     mtl_alias_drop_pool(p); o->magic = 0;
     if (o->flags & 0x200 && o->vp) vpool_release(o);
     if (o->mem && !(o->flags & 0x200)) {   // A virtual pool's storage is borrowed from a physical pool; do not unregister it
@@ -440,6 +442,8 @@ NVN(nvnTextureBuilderSetDepth, void, NVNtextureBuilder *b, int v) { TB(b)->d.dep
 NVN(nvnTextureBuilderSetSize1D, void, NVNtextureBuilder *b, int w) { TB(b)->d.width = w; TB(b)->d.height = TB(b)->d.depth = 1; }
 NVN(nvnTextureBuilderSetLevels, void, NVNtextureBuilder *b, int v) { TB(b)->d.levels = v; }
 NVN(nvnTextureBuilderSetFormat, void, NVNtextureBuilder *b, NVNformat f) { TB(b)->d.format = f; }
+NVN(nvnTextureBuilderSetGLTextureName, void, NVNtextureBuilder *b, uint32_t name) { TB(b)->gl_name = name; }
+NVN(nvnTextureBuilderGetGLTextureName, uint32_t, const NVNtextureBuilder *b) { return ((const tex_builder_t *)b)->gl_name; }
 NVN(nvnTextureBuilderSetSamples, void, NVNtextureBuilder *b, int s) { TB(b)->d.samples = s; }
 NVN(nvnTextureBuilderSetStride, void, NVNtextureBuilder *b, ptrdiff_t s) { TB(b)->d.stride = (uint32_t)s; }
 NVN(nvnTextureBuilderSetStorage, void, NVNtextureBuilder *b, NVNmemoryPool *p, ptrdiff_t off) { TB(b)->pool = (pool_t *)p; TB(b)->off = off; }
@@ -481,6 +485,8 @@ NVN(nvnTextureBuilderGetSparseTileLayout, void, const NVNtextureBuilder *b, NVNt
 // stamp: dirty-page generation at registration (tex_dirty_upload); span: its tracked range (nvn_dirty_span), so a check needs no search over every pool; edge_h: hashes of its bytes in its edge pages at the stamp (ft_edges_take), edged = they hold
 typedef struct { const uint8_t *mem; uint64_t size; tex_t t; uint64_t stamp; const void *span; uint64_t edge_h[2]; int edged; } flush_tex;
 static flush_tex *g_ft; static size_t g_nft, g_cft; static pthread_mutex_t g_ft_mu = PTHREAD_MUTEX_INITIALIZER;
+// Serializes nvn_ft_poll's out-of-lock rewrite pass with nvnMemoryPoolFinalize (ft_drop_pool), so a poll never reads freed pool memory or resurrects g_cpu_pools after finalize. Lock order: g_ft_poll_mu → g_ft_mu / g_smu
+static pthread_mutex_t g_ft_poll_mu = PTHREAD_MUTEX_INITIALIZER;
 // Writes beside a registered texture (tex_dirty_upload). The tracker marks whole host pages (16 KB) dirty, and a texture's storage need not start or end on one: its first and last pages
 // are shared with whatever lies beside it, as for the packaged textures' re-uploads (pkg_edges_clean in nvn_mtl.m). The Great Ace Attorney Chronicles keeps its window textures and render
 // targets in its 1000 MB CPU_CACHED pool at 0x200 past a page, beside textures it fills from the CPU (ser=262, 256x256, shares the first window texture's last page): every 1920x1080 one,
@@ -541,6 +547,17 @@ static void ft_del(uint64_t serial) {
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { g_ft[i] = g_ft[--g_nft]; break; }
     pthread_mutex_unlock(&g_ft_mu);
 }
+// A memory pool's Finalize ends every texture made on its storage, whether or not its texture objects have been finalized yet: drop them from g_ft before the pool's dirty range and
+// backing memory go, so nvn_ft_poll never hashes unmapped edge pages (ft_hash) or hands a dangling t->pool to mtl_tex_cpu_rewritten, and ft_flush never matches reused addresses
+static void ft_drop_pool(const void *pool) {
+    if (!DM_GAME_TEX_FLUSH_UPLOAD || !pool) return;
+    pthread_mutex_lock(&g_ft_poll_mu);
+    pthread_mutex_lock(&g_ft_mu);
+    for (size_t i = 0; i < g_nft;)
+        if (g_ft[i].t.pool == pool) g_ft[i] = g_ft[--g_nft]; else i++;
+    pthread_mutex_unlock(&g_ft_mu);
+    pthread_mutex_unlock(&g_ft_poll_mu);
+}
 // Profile tex_dirty_upload: Tears of the Kingdom fills some textures from the CPU after creating them and publishes them with no NVN flush at all (os::FlushDataCache runs
 // natively; its 121-layer ASTC terrain material arrays, 42 MB each). They stayed GPU-only textures with content 0, which ASTC decodes as the error colour, and the cave came out magenta.
 // ft_add write-protects a registered texture's pages, and on its first resolution (tex_mtl, submit thread) a write since then makes it CPU-written like a flushed one
@@ -573,11 +590,13 @@ int nvn_ft_tracked(uint64_t serial) {   // registered and not resolved yet: its 
 enum { FT_POLL_BYTES = 128 << 20 };
 void nvn_ft_poll(void) {
     if (!DM_GAME_TEX_DIRTY_UPLOAD) return;
+    pthread_mutex_lock(&g_ft_poll_mu);
     static uint64_t gen; static size_t cur, left;
     static struct { tex_t t; size_t at; int how; } *hit; static size_t chit; size_t nhit = 0;
     uint64_t now = nvn_dirty_now(), scanned = 0;
     pthread_mutex_lock(&g_ft_mu);
     if (now != gen) { gen = now; left = g_nft; }   // guest memory changed: every entry gets one more look
+    if (left > g_nft) left = g_nft;
     while (left && g_nft && scanned < FT_POLL_BYTES) {
         if (cur >= g_nft) cur = 0;
         scanned += g_ft[cur].size; left--;
@@ -588,7 +607,7 @@ void nvn_ft_poll(void) {
         cur++;
     }
     pthread_mutex_unlock(&g_ft_mu);
-    if (!nhit) return;
+    if (!nhit) { pthread_mutex_unlock(&g_ft_poll_mu); return; }
     uint64_t st = nvn_dirty_now();
     for (size_t i = 0; i < nhit; i++) nvn_dirty_protect(hit[i].t.mem, hit[i].t.L.size);
     static uint64_t up, kept;
@@ -612,6 +631,7 @@ void nvn_ft_poll(void) {
         else g_ft[j] = g_ft[--g_nft];
     }
     pthread_mutex_unlock(&g_ft_mu);
+    pthread_mutex_unlock(&g_ft_poll_mu);
 }
 static void ft_flush(const uint8_t *a, uint64_t n) {
     if (!DM_GAME_TEX_FLUSH_UPLOAD || !a || !n) return;
@@ -673,8 +693,14 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     const tex_builder_t *s = (const tex_builder_t *)b; tex_t *o = TX(t);
     // Re-initializing a texture object that is still live (without a Finalize first): release the host texture of the old serial first. SMBW re-initializes its transient render targets on the same object every frame and never Finalizes them;
     //   previously every init created a new private MTLTexture and the old one stayed in the serial table forever, so GPU memory grew about 13 MB per frame (killed by the memory watchdog at 24 GB)
-    if (o->magic == MAGIC('T', 'E', 'X', 0) && o->serial) { static uint64_t n; if (!n++) LOG("[nvn] TextureInitialize on a texture object that is still live (no Finalize): releasing the old host texture (first case ser=%llu)", (unsigned long long)o->serial); mtl_tex_release(o); }
+    if (o->magic == MAGIC('T', 'E', 'X', 0) && o->serial) { static uint64_t n; if (!n++) LOG("[nvn] TextureInitialize on a texture object that is still live (no Finalize): releasing the old host texture (first case ser=%llu)", (unsigned long long)o->serial); uint64_t old = o->serial; if (mtl_tex_release(o)) ft_del(old); }   // and its registration, when that ends the texture (nvnTextureFinalize)
     memset(o, 0, sizeof *o);
+    if (s->gl_name) {
+        o->magic = MAGIC('T', 'E', 'X', 0); o->serial = nvn_new_serial();
+        if (mtl_tex_init_gl(o, s->gl_name)) return 1;
+        memset(o, 0, sizeof *o);
+        return 0;
+    }
     o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
     // NVN2 device flag bit 16 selects X1 order in CPU copies and descriptor word 2 bit 24. Keep the owning device's order in the texture snapshot.
     if (dm_sdk_ounce()) {
@@ -703,7 +729,10 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     ft_add(o);
     return 1;
 }
-NVN(nvnTextureFinalize, void, NVNtexture *t) { ft_del(TX(t)->serial); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
+// The texture's registration for the CPU's writes (ft_add) goes only when this Finalize ends the texture. NVNtexture is plain data and engines finalize copies of it while the
+// object it was initialized in lives on (own_tex_end_locked: Breath of the Wild about 100 a frame, Ocarina of Time every few frames): taken out first, at any copy's Finalize,
+// the texture left the poll and its first-use check, so the CPU's later writes to it were never uploaded (GitHub issue #2975)
+NVN(nvnTextureFinalize, void, NVNtexture *t) { uint64_t serial = TX(t)->serial; if (mtl_tex_release(TX(t))) ft_del(serial); TX(t)->magic = 0; }
 NVN(nvnTextureGetFlags, NVNtextureFlags, const NVNtexture *t) { return (NVNtextureFlags)CTX(t)->d.flags; }
 NVN(nvnTextureGetWidth, int, const NVNtexture *t) { return (int)CTX(t)->d.width; }
 NVN(nvnTextureGetHeight, int, const NVNtexture *t) { return (int)CTX(t)->d.height; }
@@ -959,6 +988,30 @@ NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a
 // depth-stencil state still does. The host does no ZCull, so there is nothing to set (Donkey Kong Bananza: EQUAL, 0xff)
 NVN_NOPROTO(nvnCommandBufferSetStencilCullCriteria, void, NVNcommandBuffer *c, int func, int ref) { (void)c; (void)func; (void)ref; }
 static _Atomic uint64_t g_sync_ns;
+__attribute__((weak)) void *dm_gl_event(void) { return NULL; }
+__attribute__((weak)) void *dm_gl_sync_publish(uint64_t serial, int from_nvn) { (void)serial; (void)from_nvn; return NULL; }
+__attribute__((weak)) int dm_gl_sync_serial(const void *sync, uint64_t *serial, int *from_nvn) { (void)sync; (void)serial; (void)from_nvn; return 0; }
+__attribute__((weak)) int dm_gl_wait_serial(uint64_t serial, uint64_t timeout_ns) { (void)serial; (void)timeout_ns; return 0; }
+static int nvn_sync_gpu_point(const sync_t *s, uint64_t *serial, int *from_nvn);
+// The SDK uses two arguments for export and a fourth, status out, for import.
+// 0 is success, 4 means that the interop operation could not be performed.
+NVN_NOPROTO(nvnSyncCreateGLSync, int, const NVNsync *s, void **gl_sync) {
+    uint64_t serial = 0;
+    int from_nvn = 0;
+    if (!gl_sync) return 4;
+    *gl_sync = nvn_sync_gpu_point((const sync_t *)s, &serial, &from_nvn) ? dm_gl_sync_publish(serial, from_nvn) : NULL;
+    return *gl_sync ? 0 : 4;
+}
+NVN_NOPROTO(nvnSyncInitializeFromFencedGLSync, NVNboolean, NVNsync *s, NVNdevice *d, const void *gl_sync, int *status) {
+    (void)d;
+    int from_nvn = 0;
+    uint64_t serial = 0;
+    int valid = dm_gl_sync_serial(gl_sync, &serial, &from_nvn);
+    if (status) *status = valid ? 0 : 4;
+    if (!valid) return 0;
+    *(sync_t *)s = (sync_t){MAGIC('S', 'Y', 'N', 'C'), from_nvn ? 1 : NVN_SYNC_GL, serial};
+    return 1;
+}
 typedef struct acq_wait acq_wait_t;
 static int acq_wait_run(acq_wait_t *aw, uint64_t timeout_ns, int *waited, uint64_t *gpu_fence_out);
 static void acq_wait_unref(acq_wait_t *aw);
@@ -976,6 +1029,13 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     // menu's Next) and then waits 15 s on the one it has not fenced yet, aborting on TIMEOUT_EXPIRED or FAILED (main+0x4a8cf0) once two frames are in flight: a shipped path,
     // so on the console that wait does not expire. Answered as a timeout (the host's rule from its first version, with no game behind it), the game aborted at once
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    if (o->fenced == NVN_SYNC_GL) {
+        if (dm_gl_wait_serial(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+        uint64_t t0 = now_ns();
+        int ok = timeout && dm_gl_wait_serial(o->fence, timeout);
+        atomic_fetch_add(&g_sync_ns, now_ns() - t0);
+        return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : sync_expired(o, timeout, now_ns() - t0);
+    }
     if (o->fenced == 4) {
         uint64_t ah = nvn_sync_ref_acq(o);
         if (!ah) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
