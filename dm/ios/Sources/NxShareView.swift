@@ -27,7 +27,6 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
         case failed(String)
     }
 
-    @Published var serverURL: String
     @Published var phase: Phase = .idle
     @Published var manifest: NxShareManifest?
     @Published var currentFileName: String = ""
@@ -40,6 +39,7 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
 
     let titleId: String
     let appName: String
+    private let serverURL: String
 
     private let monitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "org.nxnative.nxshare.net")
@@ -51,15 +51,14 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
     private var pendingFiles: [NxShareFile] = []
     private var onComplete: (() -> Void)?
 
-    private static let savedURLKey = "nxshare.serverURL"
+    private static let defaultServerURL = "https://nx.jvrcruz.games"
 
     override init() {
         let info = Bundle.main.infoDictionary ?? [:]
         self.titleId = (info["DMTitleID"] as? String) ?? ""
         self.appName = (info["CFBundleDisplayName"] as? String) ?? "Game"
-        let plistURL = info["DMNxShareURL"] as? String
-        let saved = UserDefaults.standard.string(forKey: Self.savedURLKey)
-        self.serverURL = saved ?? plistURL ?? "http://"
+        let plistURL = (info["DMNxShareURL"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.serverURL = (plistURL?.isEmpty == false ? plistURL! : Self.defaultServerURL).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         super.init()
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
@@ -85,20 +84,14 @@ private final class NxShareModel: NSObject, ObservableObject, URLSessionDownload
 
     func start(onComplete: @escaping () -> Void) {
         self.onComplete = onComplete
-        let trimmed = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.count > "http://".count, URL(string: trimmed)?.host != nil {
-            fetchManifest()
-        }
+        fetchManifest()
     }
 
     func fetchManifest() {
-        let base = serverURL.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard !base.isEmpty, let url = URL(string: "\(base)/api/apps/\(titleId)/manifest") else {
-            phase = .failed("Enter a valid nxshare server URL (e.g. http://192.168.1.10:8080).")
+        guard let url = URL(string: "\(serverURL)/api/apps/\(titleId)/manifest") else {
+            phase = .failed("Invalid server configuration.")
             return
         }
-        UserDefaults.standard.set(base, forKey: Self.savedURLKey)
-        serverURL = base
         phase = .fetchingManifest
 
         let task = session.dataTask(with: url) { [weak self] data, response, error in
@@ -281,17 +274,12 @@ private struct NxShareView: View {
                 }
 
                 Section {
-                    TextField("http://192.168.1.10:8080", text: $model.serverURL)
-                        .keyboardType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .disabled(isBusy)
-                    Button("Connect & Download") {
+                    Button("Download game data") {
                         model.fetchManifest()
                     }
-                    .disabled(isBusy || model.serverURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(isBusy)
                 } header: {
-                    Text("NxShare Server")
+                    Text("Download")
                 }
 
                 switch model.phase {
