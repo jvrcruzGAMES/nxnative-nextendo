@@ -158,7 +158,7 @@ See [Nextendo Network in Development](docs/development.md#nextendo-network) for 
 
 ### Tested Games
 
-- **[Mario Kart 8 Deluxe](dm/games/0100152000022000/README.md)** (`0100152000022000`): Nextendo login, matchmaking, and online play verified on macOS.
+- **[Mario Kart 8 Deluxe](dm/games/0100152000022000/README.md)** (`0100152000022000`): Nextendo login, matchmaking, and online play verified on macOS (requires building with firmware 22.5.0 via `--firmware`).
 
 ## Discussions
 
