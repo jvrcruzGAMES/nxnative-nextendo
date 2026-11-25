@@ -24,10 +24,13 @@ void dm_gamepad_active(void);
 
 void front_ios_boot(void);
 int front_ios_boot_ok(void);
+int front_ios_nxshare_needed(void);
+int front_ios_reload_boot_env(void);
 const char *front_ios_boot_message(void);   // main.m: why a build that keeps the game files off the IPA found none usable (NULL = the generic hint)
 const char *front_ios_device_check(void);   // main.m: why this device cannot run the games (its GPU has no BC textures; NULL = supported)
 bool front_ios_hud_enabled_from_saved_choice(void);   // main.m: the saved choice enabled Metal's HUD at launch
 bool dm_show_launcher(void *view_controller, void (*done)(void));   // Launcher.swift: false = no launcher (no dm/launcher.json, or DM_LAUNCHER=0)
+void dm_show_nxshare_downloader(void *view_controller, void (*done)(void));   // NxShareView.swift
 
 static CAMetalLayer *g_layer;
 static void front_ios_notify_setup(void);
@@ -104,6 +107,12 @@ static void tv_attach(void);
 static DmRootVC *g_root;
 static CGFloat g_picture_aspect = DM_PICTURE_16_9;   // the presented picture's width / height (front_picture_shape); main thread
 static void launcher_done(void) { [g_root startGame]; }
+static void nxshare_done(void) {
+    if (front_ios_reload_boot_env()) {
+        if (!dm_show_launcher((__bridge void *)g_root, launcher_done)) [g_root startGame];
+        front_ios_notify_ask();
+    }
+}
 @implementation DmRootVC
 - (void)loadView { self.view = [DmRootView new]; }
 - (void)showHint:(NSString *)text {   // why the game cannot start, centered over the black screen
@@ -125,9 +134,11 @@ static void launcher_done(void) { [g_root startGame]; }
 #endif
     front_ios_power_watch();
     front_ios_notify_setup();
-    if (!front_ios_boot_ok()) {   // No game files: show a hint and do not start the host
-        const char *why = front_ios_boot_message();
-        [self showHint:why ? [NSString stringWithFormat:@"Game files unusable.\n%s", why] : @"Game files not found.\nPut the RomFS folder into this App's Documents as \"romfs\" (Files app), then restart."]; return;
+    if (!front_ios_boot_ok()) {   // No game files: show a hint and do not start the host (unless nxshare downloader will fetch them)
+        if (!front_ios_nxshare_needed()) {
+            const char *why = front_ios_boot_message();
+            [self showHint:why ? [NSString stringWithFormat:@"Game files unusable.\n%s", why] : @"Game files not found.\nPut the RomFS folder into this App's Documents as \"romfs\" (Files app), then restart."]; return;
+        }
     }
     front_ios_audio_watch();
 #if defined(__IPHONE_27_0)   // compiled only with an SDK that has the scene accessory API
@@ -225,6 +236,11 @@ static void launcher_done(void) { [g_root startGame]; }
 }
 - (void)viewDidAppear:(BOOL)a {
     [super viewDidAppear:a];
+    if (!front_ios_boot_ok() && front_ios_nxshare_needed() && !self.launched) {
+        self.launched = YES; g_root = self;
+        dm_show_nxshare_downloader((__bridge void *)self, nxshare_done);
+        return;
+    }
     if (!front_ios_boot_ok() && front_ios_boot_message() && !self.presentedViewController) {   // a slim build whose game file image is missing or another version (main.m)
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Game files" message:@(front_ios_boot_message()) preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -606,6 +622,7 @@ void front_error_dialog(const char *code, const char *msg) {
 }
 
 // Native Mii editor (front.h): full-screen SwiftUI Mii Creator with 3D rendering and 2D firmware assets
+int front_mii_editor_last_index(void) { return -1; }
 int front_mii_editor(void *charinfo_out, int is_new) {
     if (!g_layer) return -1;
     extern int dm_show_mii_editor(void *charinfo_out, int is_new);

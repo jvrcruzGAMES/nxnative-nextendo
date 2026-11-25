@@ -1,6 +1,7 @@
 // Applet services (appletAE, appletOE, fatal:u) for library applets (Mii Maker, software keyboard, etc.)
 #include "hle.h"
 #include "front.h"
+#include "hle_mii.h"
 #include <stdatomic.h>
 #include <pthread.h>
 #include <string.h>
@@ -197,9 +198,11 @@ static Result library_applet_accessor_answer(sf_req *q) {
                 storage_ctx *st = g_recent_storages[i];
                 if (st && st->size >= 8) { mode = *(const uint32_t *)(st->data + 4); break; }
             }
-            int saved = front_mii_editor(dummy_charinfo, mode == 1 ? 1 : 0);
+            int is_append = (mode == 1) ? 1 : 0;
+            dm_mii_applet_prepare(dummy_charinfo, is_append);
+            int saved = front_mii_editor(dummy_charinfo, is_append);
             int front_mii_editor_last_index(void);
-            int out_idx = front_mii_editor_last_index();
+            int out_idx = dm_mii_applet_commit(dummy_charinfo, saved, is_append, front_mii_editor_last_index());
             storage_ctx *out_st = calloc(1, sizeof *out_st);
             out_st->size = 0x10;
             *(uint32_t *)(out_st->data + 0) = (saved > 0) ? 0u : 1u; // 0 = Success, 1 = Canceled

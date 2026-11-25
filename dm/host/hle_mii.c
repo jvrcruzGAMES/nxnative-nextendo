@@ -425,6 +425,48 @@ HLE_FORCE("_ZN2nn3mii11ShowMiiEditEv", "MiiEdit applet; show native Mii editor",
     return RES_OK;
 }
 
+void dm_mii_applet_prepare(void *charinfo_out, int is_append) {
+    if (!charinfo_out) return;
+    mii_db_once();
+    pthread_mutex_lock(&g_mii_mu);
+    if (!is_append && g_mii_n > 0) {
+        memcpy(charinfo_out, &g_mii_db[g_mii_n - 1], sizeof(mii_charinfo));
+    } else {
+        mii_default((mii_charinfo *)charinfo_out, 0, -1);
+    }
+    pthread_mutex_unlock(&g_mii_mu);
+}
+
+int dm_mii_applet_commit(const void *charinfo, int saved, int is_append, int applet_index) {
+    if (saved <= 0) return -1;
+    if (saved == 2) {
+        pthread_mutex_lock(&g_mii_mu);
+        mii_db_load();
+        int i = (applet_index >= 0 && applet_index < g_mii_n) ? applet_index : (g_mii_n > 0 ? g_mii_n - 1 : -1);
+        if (i >= 0) g_mii_changed = 1;
+        pthread_mutex_unlock(&g_mii_mu);
+        return i;
+    }
+    if (!charinfo) return -1;
+    pthread_mutex_lock(&g_mii_mu);
+    int i = -1;
+    if (is_append || g_mii_n == 0) {
+        if (g_mii_n < MII_DB_MAX) {
+            i = g_mii_n++;
+            memcpy(&g_mii_db[i], charinfo, sizeof(mii_charinfo));
+            g_mii_changed = 1;
+            mii_host_save();
+        }
+    } else {
+        i = g_mii_n - 1;
+        memcpy(&g_mii_db[i], charinfo, sizeof(mii_charinfo));
+        g_mii_changed = 1;
+        mii_host_save();
+    }
+    pthread_mutex_unlock(&g_mii_mu);
+    return i;
+}
+
 static int mii_get_store(void *buf, int n, int src, size_t stride) {
     int k = 0; pthread_mutex_lock(&g_mii_mu);
     for (int i = 0; (src & MII_SRC_DATABASE) && buf && k < n && i < g_mii_n; i++, k++) {

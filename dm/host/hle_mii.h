@@ -52,3 +52,6 @@ static const mii_guest_preset s_guest_miis[MII_DEFAULTS] = {
     // Guest F (Female, Pink, Brown Hair)
     { "Guest F", 1, 7, 0, 55, 2, 1, 8, 1, 2, 0, 0 },
 };
+
+void dm_mii_applet_prepare(void *charinfo_out, int is_append);
+int dm_mii_applet_commit(const void *charinfo, int saved, int is_append, int applet_index);
