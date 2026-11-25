@@ -24,13 +24,15 @@
 #define R_TIMEOUT     0xEA01u   // Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
 #define R_OUT_OF_RANGE 0xEE01u  // 119
+#define R_BAD_ENUM    0xF001u   // 120
+#define R_BUSY        0xF401u   // 122
 #define R_BAD_HANDLE  0xE401u   // 114
 #define R_BAD_STATE   0xFA01u   // 125
 #define R_OUT_OF_RES  0xCE01u   // 103
 #define WAITERS_BIT   0x40000000u
 #define H_CUR_THREAD  0xFFFF8000u
 
-enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_SHMEM };
+enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_SHMEM, O_READONLY_SHMEM, O_TRANSFER_MEMORY };
 enum { MAX_SYNC_OBJECTS = 64 };
 typedef struct { void *obj; int type; } sync_ref_t;
 // Service-layer SystemEvent bindings (see hle_bind_system_event): guest SystemEventType address → the write-end handle of its kernel event.
@@ -63,6 +65,7 @@ typedef struct thr {
     int yield_pending;         // this caller woke a higher-priority thread pinned to its core: hand off before returning to guest code
     _Atomic uint64_t hand_epoch;   // this thread's current handoff: threads it makes runnable belong to it until its next thread SVC returns (svc_thread)
     struct thr *start_by; uint64_t start_epoch;   // the lower-priority thread on this core whose StartThread holds for this thread, and that handoff (dm_thread_service_request)
+    pthread_cond_t hcv; int hwait, hcv_init;   // this thread's handoff wait, initialized on first use (G held)
     struct { struct thr *by; uint64_t epoch; } hand[4]; int nhand;   // the handoffs this thread was made runnable for (its waker's, then those the waker belonged to), until it blocks (note_runnable / hand_leave)
     _Atomic int *host_work;    // points at the thread's dm_host_work (registered when the thread starts)
     int native_wait;          // nesting depth of a blocking native HLE wait (G held)
@@ -85,9 +88,12 @@ typedef struct thr {
     mach_port_t mport;         // Host thread port (to get CPU time)
     _Atomic int qos_pending;   // SetThreadPriority from another thread changed prio: the thread applies the new class at its next SVC (only a thread can set its own QoS)
     uint32_t qos;
-    // Pausing (SetThreadActivity, used by IL2CPP's garbage collector to stop the world): pause_req = requested, paused = stopped for the current request; when stopped inside an SVC the context comes from the gate frame svc_regs (registered on SVC entry),
-    // when stopped in guest code the signal handler saves it into ctx_*; pcv lets the requester wait for "stopped" and the paused thread wait for "resume"
-    _Atomic int pause_req; int paused;
+    // Pausing (SetThreadActivity, used by IL2CPP's garbage collector to stop the world): pause_req = requested, paused = stopped for the current request;
+    // act_busy / act_waiters serialize SetThreadActivity and GetThreadContext3 on this thread (Horizon's KThread::m_activity_pause_lock) while a pause wait releases G;
+    // when stopped inside an SVC the context comes from the gate frame svc_regs (registered on SVC entry),
+    // when stopped in guest code the signal handler saves it into ctx_*; pcv lets the requester wait for "stopped", the paused thread wait for "resume",
+    // and concurrent activity/context callers wait out an in-flight pause
+    _Atomic int pause_req; int paused, act_busy, act_waiters;
     uint64_t *_Atomic svc_regs; uint64_t svc_pc, svc_x18;   // svc_x18: the guest's x18 at SVC entry (its thread slot; the gate frame holds the Apple platform register)
     // SVC exit without G: bit 0 = inside an SVC, bit 1 = a pause was requested. The exit clears bit 0 with one compare-and-swap when bit 1 is clear, and takes G only otherwise;
     // the requester sets bit 1 and treats the thread as stopped only if bit 0 was set, so a thread it counts as stopped in an SVC cannot leave the SVC without G (svc_regs stays valid for GetThreadContext3)
@@ -134,9 +140,14 @@ static pthread_key_t g_keythr;
 static uint64_t g_next_id = 0x51;
 static thr_t *g_wait;          // All waiting threads (lock / condition / address / synchronization)
 
-static uint32_t h_new(int type, void *obj) {     // Caller holds G
+static uint32_t h_try_new(int type, void *obj) {     // Caller holds G
     for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) { g_h[i].type = type; g_h[i].obj = obj; return 0x1000 + i; }
-    die("handle table full");
+    return 0;
+}
+static uint32_t h_new(int type, void *obj) {     // Caller holds G
+    uint32_t h = h_try_new(type, obj);
+    if (!h) die("handle table full");
+    return h;
 }
 static void *h_peek(uint32_t h, int type) {      // Lookup only, no report
     if (h == H_CUR_THREAD && type == O_THREAD) return pthread_getspecific(g_keythr);
@@ -169,8 +180,20 @@ static int thr_in_handoff(const thr_t *t, const thr_t *self) {
     for (int i = 0; i < t->nhand; i++) if (t->hand[i].by == self && t->hand[i].epoch == self->hand_epoch) return 1;
     return 0;
 }
+// Holding G. t stopped running guest code on its core (it blocked, exited or was paused): the threads waiting in a handoff it held look again (dm_yield_to_core_peers).
+// g_hand_cv is for the waiters of the core_preempt mode (DM_PREEMPT), which wait for every runnable higher-priority peer of their core, not only for those they woke
+static pthread_cond_t g_hand_cv = PTHREAD_COND_INITIALIZER;
+static int g_hand_waiters;
+static _Atomic uint64_t g_hand_timeouts;   // timed rechecks, read by the unlocked thread dump
+static void hand_signal(thr_t *t) {
+    for (int i = 0; i < t->nhand; i++) {
+        thr_t *by = t->hand[i].by;
+        if (by->hwait && by->hand_epoch == t->hand[i].epoch) pthread_cond_signal(&by->hcv);
+    }
+    if (g_hand_waiters) pthread_cond_broadcast(&g_hand_cv);
+}
 // Holding G. t blocked (a guest wait, a timed sleep, YieldToAnyThread): it gave its core back, so it no longer holds the threads whose handoff made it runnable
-static void hand_leave(thr_t *t) { t->nhand = 0; t->start_by = NULL; }
+static void hand_leave(thr_t *t) { hand_signal(t); t->nhand = 0; t->start_by = NULL; }
 // A file system call is a request to fsp-srv on Horizon: svcSendSyncRequest blocks the caller until the service replies, and a lower-priority thread of its core runs meanwhile.
 // The host answers in the caller's own thread, so without this the caller never gives up its core and its waker stays held until it blocks or exits. Digimon Story Cyber Sleuth's
 // save manager (main+0x16cdf0 and its neighbours) sets its busy flag after StartThread returns, and its priority-38 worker clears it last thing: on Horizon the worker's first request lets
@@ -238,19 +261,43 @@ void dm_thread_native_wait(int entering) {
 // priority (Mesosphere's KScheduler migrates suggested threads), and the host never counts peers the wake did not make runnable as busy. Batman: Arkham Knight's job workers
 // (priority 43, mask 0x5) finish a job and signal the main thread (priority 29, core 0), which then spin-waits for the next two jobs it hands them; waiting for it to block
 // left both workers in this loop for good, and the game stopped presenting as New Story loaded
+// A block, exit or pause signals the waiter. The 50 µs timeout keeps the recheck for changes that don't signal:
+// host sleeps, GPU work, and changes to priority or affinity. Only the runnable-state scan can end the handoff.
+#define HANDOFF_BACKSTOP_NS 50000
 int dm_yield_to_core_peers(int all) {
     thr_t *self = pthread_getspecific(g_keythr); if (!self) return 0;
     uint64_t bit = 1ull << (__atomic_load_n(&self->core, __ATOMIC_RELAXED) & 63); int waited = 0;   // read without G, as GetCurrentProcessorNumber does
     if (__atomic_load_n(&self->mask, __ATOMIC_RELAXED) & ~bit) return 0;
+    g_lock();
     for (;;) {
         int busy = 0;
-        g_lock();
         for (thr_t *t = g_all; t && !busy; t = t->all)
             if (t != self && t->started && !t->exited && !t->host_owned && t->mask == bit && t->prio < self->prio && thr_runnable(t) && (all || thr_in_handoff(t, self))) busy = 1;
-        g_unlock();
-        if (!busy) return waited;
-        { struct timespec ts = {0, 50000}; nanosleep(&ts, 0); } waited = 1;
+        if (!busy) break;
+        waited = 1;
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_nsec += HANDOFF_BACKSTOP_NS;
+        if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+        int rc;
+        if (all) {
+            g_hand_waiters++;
+            rc = g_cond_wait(&g_hand_cv, &dl);
+            g_hand_waiters--;
+        } else {
+            if (!self->hcv_init) {
+                rc = pthread_cond_init(&self->hcv, NULL);
+                if (rc) die("handoff condition variable: %s", strerror(rc));
+                self->hcv_init = 1;
+            }
+            self->hwait = 1;
+            rc = g_cond_wait(&self->hcv, &dl);
+            self->hwait = 0;
+        }
+        if (rc == ETIMEDOUT) atomic_fetch_add_explicit(&g_hand_timeouts, 1, memory_order_relaxed);
     }
+    g_unlock();
+    return waited;
 }
 // Take a host lock that an HLE call holds while it runs guest code. A guest thread waiting for it is in a native HLE wait (dm_thread_native_wait), blocked as it would be
 // on the guest-visible lock the SDK's own code uses there, so it does not hold a same-core handoff: Kirby and the Forgotten Land's guide movies froze the game when the movie decoder's decode lock was held across the
@@ -300,25 +347,18 @@ static void wake(thr_t *t, int64_t res) {
     wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; wake_queue(t);
     note_runnable(t);
 }
-// Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
+// Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT.
+// Relative timeouts use host time even in replay: this wait may hold up the next present that advances the guest clock.
 static int64_t block(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     hand_leave(t);
     struct timespec dl;
-    int det_wait = ns > 0 && dm_detclock_enabled();
-    uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
-    if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
+    if (ns > 0) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
     while (!t->woke) {
-        int rc;
-        if (det_wait) {
-            uint64_t now = guest_ns();
-            if (now >= guest_deadline) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
-            (void)(guest_deadline - now);
-            rc = g_cond_wait(&t->cv, NULL);
-        } else rc = ns > 0 ? g_cond_wait(&t->cv, &dl) : g_cond_wait(&t->cv, NULL);
-        if (rc == ETIMEDOUT && !t->woke && (!det_wait || guest_ns() >= guest_deadline)) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
+        int rc = g_cond_wait(&t->cv, ns > 0 ? &dl : NULL);
+        if (rc == ETIMEDOUT && !t->woke) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     }
     return t->wres;
 }
@@ -408,10 +448,16 @@ static void thr_free(thr_t *t) {   // Holding G; unlink from the all-threads cha
         for (int i = 0; i < u->nhand; ) if (u->hand[i].by == t) u->hand[i] = u->hand[--u->nhand]; else i++;
         if (u->start_by == t) u->start_by = NULL;
     }
-    pthread_cond_destroy(&t->cv); pthread_cond_destroy(&t->pcv); free(t);
+    pthread_cond_destroy(&t->cv); pthread_cond_destroy(&t->pcv); if (t->hcv_init) pthread_cond_destroy(&t->hcv); free(t);
 }
 static void thr_put(thr_t *t) {   // Holding G; drop a reference taken with t->refs++ (a wait, a pause): the last holder of a closed, exited thread frees it
     if (!--t->refs && t->closed && t->exited) thr_free(t);
+}
+static void act_wait(thr_t *t) {   // Holding G, caller holds a reference on t: wait out an in-flight SetThreadActivity pause on t (Horizon's KThread::m_activity_pause_lock)
+    if (!t->act_busy) return;
+    t->act_waiters++;
+    while (t->act_busy) g_cond_wait(&t->pcv, NULL);
+    t->act_waiters--;
 }
 static void wake_sync_waiters(const void *obj);
 static void thread_exit(thr_t *t) {
@@ -419,6 +465,9 @@ static void thread_exit(thr_t *t) {
     // No logging here: the exit happens on the guest thread's own stack (some are only a dozen or so KiB), and a printf with floating point would blow the stack (real-device smoke test: SIGBUS when LibcurlResolver exits, backtrace fprintf → __dtoa). Only the time is recorded, and it is printed later in the state dump
     g_lock();
     t->exited = 1;
+    atomic_store(&t->svc_regs, NULL); t->ctx_ok = 0;   // dead thread's pthread stack is about to be reclaimed
+    if (atomic_load(&t->pause_req)) pthread_cond_broadcast(&t->pcv);   // wake an in-flight SetThreadActivity wait at once
+    hand_signal(t);         // a handoff it held ends here
     wake_sync_waiters(t);   // Complete synchronization waits on this thread
     pthread_setspecific(g_keythr, NULL);
     if (t->closed && !t->refs) thr_free(t);
@@ -575,10 +624,12 @@ static void hitch_init(void) {
     pthread_t th; pthread_create(&th, NULL, hitch_main, (void *)e); pthread_detach(th);
     LOG("DM_HITCH_DUMP=%s: the guest threads are logged when no frame is presented for that many ms", e);
 }
+static void yield_spin_init(void);
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 uint32_t svc_thread_main_init(void) {
     pthread_key_create(&g_keythr, NULL);
     qos_map_init();
+    yield_spin_init();
     { const char *e = getenv("DM_PREEMPT"); g_core_preempt = e ? atoi(e) != 0 : DM_GAME_CORE_PREEMPT; }
     { const char *e = getenv("DM_WAKE_UNLOCKED"); if (e) g_wake_unlocked = atoi(e) != 0; }
     pause_install();
@@ -647,13 +698,6 @@ static void wake_sync_waiters(const void *obj) {
             }
         w = n; }
 }
-void dm_guest_clock_advanced(void) {
-    if (!dm_detclock_enabled()) return;
-    g_lock();
-    for (thr_t *t = g_wait; t; t = t->next) if (t->wkind) pthread_cond_signal(&t->cv);
-    g_unlock();
-}
-
 // Handle thread / synchronization SVCs; returns 1 = handled
 static const char *thr_name(thr_t *t, char *nb, size_t n) {   // SDK ThreadType+0x1a0 = name pointer
     if (!t->arg) return t->handle == 0x1001 ? "main thread" : "?";
@@ -745,7 +789,8 @@ void svc_thread_dump(void) {
     static const char *kinds[] = {"running/not waiting", "mutex", "condvar", "address", "sync object"};
     int nh = 0; for (int i = 1; i < MAX_H; i++) nh += g_h[i].type != O_FREE;
     fprintf(stderr, "[dm] handle table use %d / %d, threads created so far %llu\n", nh, MAX_H, g_next_id - 0x51);
-    fprintf(stderr, "[dm] same-core handoffs %llu, total %.1f ms\n", (unsigned long long)g_preempt_n, g_preempt_ns / 1e6);
+    fprintf(stderr, "[dm] same-core handoffs %llu, total %.1f ms, timed rechecks %llu\n",
+            (unsigned long long)g_preempt_n, g_preempt_ns / 1e6, (unsigned long long)atomic_load_explicit(&g_hand_timeouts, memory_order_relaxed));
     for (thr_t *t = g_all; t; t = t->all) {
         module_t *m = module_of((void *)t->last_lr);
         // Thread name: SDK ThreadType+0x1a0 is the name pointer (ThreadManager::SetInitialThreadNameUnsafe 0x34a2a4); x2 of CreateThread = ThreadType*
@@ -796,9 +841,11 @@ void svc_thread_dump(void) {
                     char line[1200]; int p = snprintf(line, sizeof line, "[dm] host thread %#x:", ths[i]);
                     uint64_t fp = __darwin_arm_thread_state64_get_fp(st), pc = __darwin_arm_thread_state64_get_pc(st);
                     for (int k = 0; k < 12 && p < (int)sizeof line - 80; k++) {
-                        Dl_info di; module_t *m = module_of((void *)pc);
+                        Dl_info di = {0}; module_t *m = module_of((void *)pc);
+                        int have = !m && dladdr((void *)pc, &di);
                         if (m) p += snprintf(line + p, sizeof line - p, " %s+%#llx", m->name, pc - (uint64_t)m->base);
-                        else if (dladdr((void *)pc, &di) && di.dli_sname) p += snprintf(line + p, sizeof line - p, " %s+%#lx", di.dli_sname, (unsigned long)(pc - (uint64_t)di.dli_saddr));
+                        else if (have && di.dli_sname && strcmp(di.dli_sname, "<redacted>") != 0) p += snprintf(line + p, sizeof line - p, " %s+%#lx", di.dli_sname, (unsigned long)(pc - (uint64_t)di.dli_saddr));
+                        else if (have && di.dli_fname && *di.dli_fname) { const char *sl = strrchr(di.dli_fname, '/'); const char *im = (sl && sl[1]) ? sl + 1 : di.dli_fname; p += snprintf(line + p, sizeof line - p, " %s+%#lx(%#llx)", im, (unsigned long)(pc - (uint64_t)di.dli_fbase), (unsigned long long)pc); }
                         else p += snprintf(line + p, sizeof line - p, " %#llx", pc);
                         uint64_t fr[2]; vm_size_t g2 = 0;
                         if (!fp || vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &g2) || g2 != 16 || fr[0] <= fp) break;
@@ -828,17 +875,26 @@ static int svc_thread_impl(int num, uint64_t *regs);
 // Waits under 2 ms are handoffs between threads that do work; waits beyond it are limiters and idle polls. Returns the sleep for a yield whose run started `run_ns` ago (0 = plain yield);
 // a clock wait (`clock`, thr_yield) has no start: it waits for a time, not for another thread, and sleeps from its first yield on.
 // DM_YIELD_BACKOFF=0 turns it off; DM_YIELD_BACKOFF=<cap µs>[:<start µs>] sets the cap and the run length after which it starts (default 250:2000)
-static int64_t g_bo_cap = -1, g_bo_start = 2000000;
-static void backoff_init(void) {
-    if (g_bo_cap >= 0) return;
-    const char *e = getenv("DM_YIELD_BACKOFF"); g_bo_cap = 250000;
+// Read once in svc_thread_main_init, before any other guest thread exists (defaults hold if never called).
+static int64_t g_bo_cap = 250000, g_bo_start = 2000000;
+static int g_yield_clock = 2;   // DM_YIELD_CLOCK: 0 = clock waits are yields as any other, 1 = they back off from their start but sleep to no predicted end, 2 (the default) = both
+static int g_spin_on = 1;
+static uint64_t g_spin_poll_ns = 2000000;
+static void yield_spin_init(void) {
+    const char *e = getenv("DM_YIELD_BACKOFF"); g_bo_cap = 250000; g_bo_start = 2000000;
     if (e && *e) { g_bo_cap = atoll(e) * 1000; const char *c = strchr(e, ':'); if (c) g_bo_start = atoll(c + 1) * 1000; }
-    if (!g_bo_cap) LOG("DM_YIELD_BACKOFF=0: no back-off on repeated yields (plain sched_yield spin)"); else if (e && *e) LOG("DM_YIELD_BACKOFF: back off after %lld µs of repeated yields, sleeping at most %lld µs at a time", (long long)(g_bo_start / 1000), (long long)(g_bo_cap / 1000));
+    if (!g_bo_cap) LOG("DM_YIELD_BACKOFF=0: no back-off on repeated yields (plain sched_yield spin)");
+    else if (e && *e) LOG("DM_YIELD_BACKOFF: back off after %lld µs of repeated yields, sleeping at most %lld µs at a time", (long long)(g_bo_start / 1000), (long long)(g_bo_cap / 1000));
+    e = getenv("DM_YIELD_CLOCK"); g_yield_clock = e && *e ? atoi(e) : 2;
+    if (g_yield_clock != 2) LOG("DM_YIELD_CLOCK=%d: yield loops that read the clock %s", g_yield_clock, g_yield_clock ? "back off from their start, with no sleep to a predicted end" : "back off after the start, as other yields");
+    e = getenv("DM_SPIN"); const char *p = getenv("DM_SPIN_POLL");
+    g_spin_poll_ns = (p && *p ? strtoull(p, 0, 10) : 2000) * 1000; g_spin_on = !(e && *e && atoi(e) == 0);
+    if (!g_spin_on) LOG("DM_SPIN=0: spin waits do not yield or sleep");
+    else if (p && *p) LOG("DM_SPIN_POLL: spin waits poll for %llu µs, then yield", (unsigned long long)(g_spin_poll_ns / 1000));
 }
 // The back-off's longest sleep (0: off)
-static uint64_t yield_backoff_cap(void) { backoff_init(); return (uint64_t)g_bo_cap; }
+static uint64_t yield_backoff_cap(void) { return (uint64_t)g_bo_cap; }
 static uint64_t yield_backoff_ns(uint64_t run_ns, int clock) {
-    backoff_init();
     if (!g_bo_cap || (!clock && run_ns < (uint64_t)g_bo_start)) return 0;
     uint64_t s = run_ns / 8; if (s < 10000) s = 10000;
     return s < (uint64_t)g_bo_cap ? s : (uint64_t)g_bo_cap;
@@ -867,15 +923,13 @@ static void yield_for(thr_t *me, uint64_t run_ns, int clock) {
 static void clock_wait(thr_t *me, uint64_t sig, uint64_t now, int predict);
 static void thr_yield(thr_t *me, const uint64_t *regs) {
     if (!me) { sched_yield(); return; }
-    static int clock_on = -1;   // DM_YIELD_CLOCK: 0 = clock waits are yields as any other, 1 = they back off from their start but sleep to no predicted end, 2 (the default) = both
-    if (clock_on < 0) { const char *e = getenv("DM_YIELD_CLOCK"); clock_on = e && *e ? atoi(e) : 2; if (clock_on != 2) LOG("DM_YIELD_CLOCK=%d: yield loops that read the clock %s", clock_on, clock_on ? "back off from their start, with no sleep to a predicted end" : "back off after the start, as other yields"); }
     uint64_t y0 = now_ns(), sig = 0xcbf29ce484222325ull;
     for (int i = 19; i <= 28; i++) sig = (sig ^ regs[i]) * 0x100000001b3ull;
     int same = me->yrun_svc + 1 == me->nsvc;   // no other SVC since the thread's last yield
     int moved = same && me->yrun_sig != sig && me->yrun_sig2 != sig;   // the loop moved on since its last two yields
-    int clock = clock_on && same && !moved && dm_clock_reads != me->yrun_clk;   // a wait whose pass read the clock
+    int clock = g_yield_clock && same && !moved && dm_clock_reads != me->yrun_clk;   // a wait whose pass read the clock
     me->nyield++; if (!same || moved) me->yrun_t0 = y0; me->yrun_svc = me->nsvc; me->yrun_sig2 = me->yrun_sig; me->yrun_sig = sig; me->yrun_clk = dm_clock_reads;
-    if (clock) { me->nclkyield++; clock_wait(me, sig, y0, clock_on == 2 && !dm_detclock_enabled()); }
+    if (clock) { me->nclkyield++; clock_wait(me, sig, y0, g_yield_clock == 2 && !dm_detclock_enabled()); }
     else if (!moved) yield_for(me, y0 - me->yrun_t0, 0);
     me->poll_ret = now_ns();
     if (clock && sig == me->cw_sig) me->cw_last = me->poll_ret;
@@ -940,16 +994,13 @@ static void clock_wait(thr_t *me, uint64_t sig, uint64_t now, int predict) {
 // as a yield there hands the core to other processes. DM_SPIN=0: no sleeps either. gate = the gate's address, site = the loop head (module offset)
 #define SPIN_GAP_NS 20000
 void dm_spin_wait(uint64_t gate, uint64_t site) {
-    static int on = -1; static uint64_t poll_ns;
-    if (on < 0) { const char *e = getenv("DM_SPIN"), *p = getenv("DM_SPIN_POLL"); poll_ns = (p && *p ? strtoull(p, 0, 10) : 2000) * 1000; on = !(e && *e && atoi(e) == 0);
-                  if (!on) LOG("DM_SPIN=0: spin waits do not yield or sleep"); else if (p && *p) LOG("DM_SPIN_POLL: spin waits poll for %llu µs, then yield", (unsigned long long)(poll_ns / 1000)); }
     thr_t *me = pthread_getspecific(g_keythr);
     if (!me) return;
     uint64_t now = now_ns();
     if (me->srun_svc != me->nsvc || now - me->spin_ret > SPIN_GAP_NS) me->srun_t0 = now;   // a new wait
     me->srun_svc = me->nsvc; me->nspin++;
     if (site != me->spin_site || !me->spin_mod) { const module_t *m = module_of((void *)gate); me->spin_mod = m ? m->name : "?"; me->spin_site = site; }
-    if (on && now - me->srun_t0 >= poll_ns) { me->nyield++; yield_for(me, now - me->srun_t0, 0); }
+    if (g_spin_on && now - me->srun_t0 >= g_spin_poll_ns) { me->nyield++; yield_for(me, now - me->srun_t0, 0); }
     me->spin_ret = now_ns();
 }
 // Short timed waits as polls. A wait with a timeout under 20 µs (a condition variable, WaitSynchronization or WaitForAddress) that times out is a poll, as a SleepThread that short is
@@ -960,7 +1011,7 @@ void dm_spin_wait(uint64_t gate, uint64_t site) {
 // back-off's start its timeout becomes the back-off's sleep (yield_backoff_ns), which, unlike the sleep, ends at once when the wait is signalled. The yields' register test does not
 // apply: at the SVC the SDK's own frames hold the time left (SDK 3.5.1 InternalConditionVariableImplByHorizon::TimedWait, x21). → the timeout to wait with
 static int64_t poll_wait_begin(int64_t ns) {
-    if (ns <= 0 || ns >= 20000 || dm_detclock_enabled()) return ns;
+    if (ns <= 0 || ns >= 20000) return ns;
     thr_t *me = pthread_getspecific(g_keythr); if (!me) return ns;
     uint64_t now = now_ns();
     if (me->yrun_svc + 1 != me->nsvc || now - me->poll_ret > SPIN_GAP_NS) me->yrun_t0 = now;   // a new run
@@ -972,7 +1023,7 @@ static int64_t poll_wait_begin(int64_t ns) {
 }
 // After the wait (ns: the guest's timeout): a signalled wait ends the run, the loop moves on
 static void poll_wait_end(int64_t ns, int64_t r) {
-    if (ns <= 0 || ns >= 20000 || dm_detclock_enabled()) return;
+    if (ns <= 0 || ns >= 20000) return;
     thr_t *me = pthread_getspecific(g_keythr); if (!me) return;
     if (r == R_TIMEOUT) me->poll_ret = now_ns(); else me->yrun_svc = 0;
 }
@@ -1044,15 +1095,10 @@ static void sleep_precise(uint64_t dl) {
         struct timespec ts = {(time_t)(s / 1000000000u), (long)(s % 1000000000u)}; nanosleep(&ts, 0);
     }
 }
-// A guest thread sleeps ns nanoseconds the way SleepThread does: on the guest clock under the deterministic clock, else on time (sleep_precise). Also for host hooks that stand for a
-// call which blocks on hardware (hle_net.c: Poll / Select with nothing to wait on)
+// SleepThread takes a relative duration. Host time lets the thread resume even if its work is needed to present the next frame.
+// Also used by host hooks that block on hardware (hle_net.c: Poll / Select with nothing to wait on).
 void dm_guest_sleep_ns(int64_t ns) {
     if (ns <= 0) return;
-    if (dm_detclock_enabled()) {
-        uint64_t deadline = guest_ns() + (uint64_t)ns;
-        while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
-        return;
-    }
     thr_t *me = pthread_getspecific(g_keythr); if (me) me->sleeping = 1;
     sleep_precise(now_ns() + (uint64_t)ns);
     if (me) me->sleeping = 0;
@@ -1117,8 +1163,8 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         // A sleep, and YieldToAnyThread (-2), which takes the thread off its core so that lower-priority threads run there, end its part in a handoff;
         // the other yields (0, -1) pass the core only to threads of its own priority or higher
         if ((ns > 0 || ns == -2) && me && me->nhand) { g_lock(); hand_leave(me); g_unlock(); }
-        if (me && ns >= 20000 && (uint64_t)ns < yield_backoff_cap() && !dm_detclock_enabled()) poll_sleep(me, ns);   // a short sleep: a poll
-        else if ((ns > 0 && dm_detclock_enabled()) || ns >= 20000) dm_guest_sleep_ns(ns);
+        if (me && ns >= 20000 && (uint64_t)ns < yield_backoff_cap()) poll_sleep(me, ns);   // a short sleep: a poll
+        else if (ns >= 20000) dm_guest_sleep_ns(ns);
         // Yield (0 / -1 / -2), and sleeps shorter than 20 µs, which sleep_precise would return from at once: Super Mario Galaxy's Hagi polls with SleepThread(100 ns) (main+0x517c),
         // which kept a core at 100% (1.4 billion calls in 200 s); as yields they get the back-off below.
         // Count and time of the main thread's yields are recorded: a render task graph's "wait for everything to finish" is often pure polling + yield; measure how much of a frame it takes
@@ -1151,36 +1197,61 @@ static int svc_thread_impl(int num, uint64_t *regs) {
                  regs[0] = (uint64_t)(uint32_t)(c >= 0 ? c : m ? __builtin_ctzll(m) : 0); return 1; }
     case 0x32: {  // SetThreadActivity(w0 thread, w1 0 runnable / 1 paused): see "Pausing threads" above
         thr_t *me = cur(); int act = (int)regs[1];
+        if (act != 0 && act != 1) { regs[0] = R_BAD_ENUM; return 1; }
         g_lock();
         thr_t *t = h_get((uint32_t)regs[0], O_THREAD); int64_t r = 0;
         if (!t) r = R_BAD_HANDLE;
-        else if (t == me) r = R_BAD_STATE;
-        else if (act == 1) {
-            atomic_store(&t->pause_req, 1);
-            int st = atomic_fetch_or(&t->svc_state, 2);
-            if (!t->started || t->exited || (st & 1)) t->paused = 1;
-            uint64_t t0 = now_ns(); int warned = 0;
-            // The loop lets go of G (the signal, the timed wait): hold a reference so that an exit and a CloseHandle meanwhile cannot free t under it
+        else if (t == me) r = R_BUSY;
+        else {
+            // Hold a reference across any wait (act_wait or the pause loop below) so an exit and a CloseHandle meanwhile cannot free t.
+            // Horizon's KThread::SetActivity serializes on m_activity_pause_lock, takes a thread that is Waiting or Runnable with no request of the same kind pending, and answers InvalidState
+            // otherwise: a thread not yet started or already exited, a second pause, a resume of a thread that is not paused. The host used to answer success to all of them and, for a pause
+            // before StartThread, set `paused` at once: the thread then ran guest code once started (thread_main waits only for `started`) while the requester believed it stopped (issue #1855)
             t->refs++;
-            while (!t->paused && !t->exited) {
-                g_unlock(); pthread_kill(t->pt, SIGUSR2); g_lock();
-                if (t->paused || t->exited) break;
-                struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 100000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
-                g_cond_wait(&t->pcv, &dl);
-                if (!warned && now_ns() - t0 > 1000000000ull) { warned = 1; LOG("[RED] thread %#x still not suspended after more than 1 second (stuck in host code?)", t->handle); }
-            }
+            act_wait(t);
+            if (!t->started || t->exited) r = R_BAD_STATE;
+            else if (act == 1) {
+                if (atomic_load(&t->pause_req)) r = R_BAD_STATE;
+                else {
+                    atomic_store(&t->pause_req, 1); hand_signal(t);   // a paused thread holds no handoff
+                    int st = atomic_fetch_or(&t->svc_state, 2);
+                    if (st & 1) t->paused = 1;
+                    t->act_busy = 1;
+                    uint64_t t0 = now_ns(); int warned = 0;
+                    while (!t->paused && !t->exited) {
+                        g_unlock(); pthread_kill(t->pt, SIGUSR2); g_lock();
+                        if (t->paused || t->exited) break;
+                        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 100000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+                        g_cond_wait(&t->pcv, &dl);
+                        if (!warned && now_ns() - t0 > 1000000000ull) { warned = 1; LOG("[RED] thread %#x still not suspended after more than 1 second (stuck in host code?)", t->handle); }
+                    }
+                    t->act_busy = 0;
+                    if (t->act_waiters) pthread_cond_broadcast(&t->pcv);
+                }
+            } else if (!atomic_load(&t->pause_req)) r = R_BAD_STATE;
+            else { atomic_store(&t->pause_req, 0); atomic_fetch_and(&t->svc_state, ~2); t->paused = 0; pthread_cond_broadcast(&t->pcv); }
             thr_put(t);
-        } else { atomic_store(&t->pause_req, 0); atomic_fetch_and(&t->svc_state, ~2); t->paused = 0; pthread_cond_broadcast(&t->pcv); }
+        }
         g_unlock();
-        { static int n; if (n++ < 4) LOG("SetThreadActivity %#x → %s (%s)", (uint32_t)regs[0], act ? "pause" : "resume", r ? "failed" : "ok"); }
+        { static _Atomic int n; if (atomic_fetch_add_explicit(&n, 1, memory_order_relaxed) < 4) LOG("SetThreadActivity %#x → %s (%s)", (uint32_t)regs[0], act ? "pause" : "resume", r ? "failed" : "ok"); }
         regs[0] = (uint64_t)r; return 1;
     }
     case 0x33: {  // GetThreadContext3(x0 out ThreadContext*, w1 thread): only for stopped threads
+        thr_t *me = cur();
         g_lock();
         thr_t *t = h_get((uint32_t)regs[1], O_THREAD); int64_t r = 0;
         if (!t) r = R_BAD_HANDLE;
-        else if (!t->paused) r = R_BAD_STATE;
-        else ctx_fill(t, (hz_ctx_t *)regs[0]);
+        else if (t == me) r = R_BUSY;
+        else {
+            t->refs++;
+            act_wait(t);
+            // Horizon's KThread::GetThreadContext3 serializes on m_activity_pause_lock, requires SuspendType_Thread, and zeroes out without failing if the thread has since exited
+            if (!atomic_load(&t->pause_req)) r = R_BAD_STATE;
+            else if (t->exited) memset((hz_ctx_t *)regs[0], 0, sizeof(hz_ctx_t));
+            else if (!t->paused) r = R_BAD_STATE;
+            else ctx_fill(t, (hz_ctx_t *)regs[0]);
+            thr_put(t);
+        }
         g_unlock();
         regs[0] = (uint64_t)r; return 1;
     }
@@ -1340,12 +1411,44 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             t->closed = 1;
             if (!t->started) pthread_cond_broadcast(&t->cv);   // a thread that never started ends now (thread_main)
             if (t->exited && !t->refs) thr_free(t);
+        } else if (i > 0 && i < MAX_H && g_h[i].type == O_READONLY_SHMEM) {
+            g_h[i].type = O_FREE; g_h[i].obj = NULL;
+        } else if (i > 0 && i < MAX_H && g_h[i].type == O_TRANSFER_MEMORY) {
+            free(g_h[i].obj);
+            g_h[i].type = O_FREE; g_h[i].obj = NULL;
         }
         g_unlock();
         regs[0] = 0; return 1;
     }
     }
     return 0;
+}
+
+uint32_t hle_new_readonly_shmem(const hle_readonly_shmem *memory) {
+    g_lock(); uint32_t h = h_new(O_READONLY_SHMEM, (void *)memory); g_unlock();
+    return h;
+}
+const hle_readonly_shmem *hle_get_readonly_shmem(uint32_t handle) {
+    g_lock(); const hle_readonly_shmem *memory = h_peek(handle, O_READONLY_SHMEM); g_unlock();
+    return memory;
+}
+
+uint32_t hle_new_transfer_memory(hle_transfer_memory memory) {
+    hle_transfer_memory *object = malloc(sizeof *object);
+    if (!object) return 0;
+    *object = memory;
+    g_lock(); uint32_t h = h_try_new(O_TRANSFER_MEMORY, object); g_unlock();
+    if (!h) free(object);
+    return h;
+}
+
+int hle_get_transfer_memory(uint32_t handle, hle_transfer_memory *memory) {
+    g_lock();
+    const hle_transfer_memory *object = h_peek(handle, O_TRANSFER_MEMORY);
+    int found = object != NULL;
+    if (found) *memory = *object;
+    g_unlock();
+    return found;
 }
 
 // ---------- SystemEvent of the service layer ----------
