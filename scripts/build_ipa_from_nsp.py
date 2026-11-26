@@ -4003,11 +4003,20 @@ def _main(args, cleanup):
         if not fw_path.exists():
             raise BuildError(f'firmware path not found: {fw_path}')
         fw_sys = work / 'system'
-        PROG.stage('firmware', step='extracting')
-        fw_log = logs / 'fw_extract.log'
-        run(['dotnet', 'run', '--project', str(repo / 'dm/tools/fw_extract/fw_extract.csproj'), '--', str(keys), str(fw_path), str(fw_sys)], fw_log, env=env)
-        PROG.end(f'{fw_path.name}')
-        say(f'firmware system data: extracted to {fw_sys}')
+        fw_stamp = fw_sys / '.fw_stamp'
+        fw_prog = repo / 'dm/tools/fw_extract/Program.cs'
+        st_fw = fw_path.stat()
+        want_stamp = f'{fw_path}\t{st_fw.st_size}\t{st_fw.st_mtime_ns}\t{fw_prog.stat().st_mtime_ns}\n'
+        if fw_stamp.is_file() and fw_stamp.read_text() == want_stamp:
+            say(f'firmware system data: cached at {fw_sys}')
+        else:
+            PROG.stage('firmware', step='extracting')
+            fw_log = logs / 'fw_extract.log'
+            dotnet_env = dict(env, DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER='1')
+            run(['dotnet', 'run', '--disable-build-servers', '-p:UseSharedCompilation=false', '--project', str(repo / 'dm/tools/fw_extract/fw_extract.csproj'), '--', str(keys), str(fw_path), str(fw_sys)], fw_log, env=dotnet_env)
+            fw_stamp.write_text(want_stamp)
+            PROG.end(f'{fw_path.name}')
+            say(f'firmware system data: extracted to {fw_sys}')
 
     picks = pick_nsps(fam, have, versions)
     nup_label = pack_nup.display_label(picks[pkg_ver][1] or picks[pkg_ver][0]) if nup else ''
