@@ -280,11 +280,21 @@ fi
 P=Payload/DmIOS.app
 SKIP=(--skip $P/_CodeSignature --skip $P/embedded.mobileprovision --skip $P/msl --skip $P/aoc --skip $P/romfs --skip $P/romfs.img --skip $P/romfs.id --skip $P/html --skip $P/jit --skip $P/romfs_programs)
 if [ -n "${PROGRAMS_TSV:-}" ]; then   # each program's shader libraries, RomFS, offline HTML pages and nn::jit image under its own folder
-  [ "${DM_COPY_ROMFS:-YES}" != NO ] || die "DM_COPY_ROMFS=NO: a game of several programs keeps its programs' files in the app"
+  if [ "$DM_NXSHARE" = YES ]; then DM_COPY_ROMFS=NO; fi
+  if [ "${DM_COPY_ROMFS:-YES}" = NO ]; then
+    [ -n "${DM_MIIEDIT_PROGRAM:-}" ] && [ "$(prog_rows | wc -l | tr -d ' ')" -le 2 ] \
+      || die "DM_COPY_ROMFS=NO: a game of several programs keeps its programs' files in the app"
+    t "no game files in the IPA for program 0 (DM_COPY_ROMFS=NO): the app takes Documents/romfs.img, while MiiEdit stays bundled"
+  fi
   MAPS=("$P=$APP")
   if [ -n "$AOC" ] && [ -d "$AOC" ]; then MAPS+=("$P/aoc=$AOC"); fi
   while IFS= read -r row; do prog_set "$row"; SKIP+=(--skip "$P/p$PN")
-    if [ -f "$ROMFS" ]; then MAPS+=("$P/p$PN/romfs.img=$ROMFS"); else MAPS+=("$P/p$PN/romfs=$ROMFS"); fi
+    if [ "$PN" = 0 ] && [ "${DM_COPY_ROMFS:-YES}" = NO ]; then
+      if [ -f "$ROMFS" ]; then
+        mkdir -p "$O" && "${DM_PYTHON:-python3}" -I "$DM/tools/romfs_image.py" --identity "$ROMFS" "$GAME" "$DM_APP_VERSION" "${PKG:-}" > "$O/romfs.id" || die "identity of $ROMFS"
+        MAPS+=("$P/romfs.id=$O/romfs.id"); t "game files identity: $(cat "$O/romfs.id")"
+      fi
+    elif [ -f "$ROMFS" ]; then MAPS+=("$P/p$PN/romfs.img=$ROMFS"); else MAPS+=("$P/p$PN/romfs=$ROMFS"); fi
     MAPS+=("$P/msl/p$PN/$MSLDIR=$MSL_IOS/$MSLDIR")
     if [ "$GFXAPI" = nvn ] && [ -s "$GD/gl_capture.tsv" ]; then MAPS+=("$P/msl/p$PN/gl=$MSL_IOS/gl"); fi
     if [ -d "$(dirname "$ROMFS")/html" ]; then MAPS+=("$P/p$PN/html=$(dirname "$ROMFS")/html"); fi

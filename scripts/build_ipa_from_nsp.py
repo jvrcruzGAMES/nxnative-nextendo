@@ -4212,8 +4212,9 @@ def _main(args, cleanup):
     if getattr(args, 'in_programs', None) is not None:   # a program of the game: the app its first program's build packs takes these
         rmtree(work / 'tmp'); return {'row': (PROGRAM_INDEX, g.id, patched, romfs, ios, gfx), 'ex': ex, 'keep': keep}
     programs = other_programs(args, g)
+    if programs and romfs_mode == 'separate': raise BuildError('a game of several programs keeps its files in the app (ROMFS / --romfs bundle): Documents holds one RomFS image, one program\'s')
     mii_dump = fw_sys / 'applets/0100000000001009' if fw_sys else None
-    if mii_dump and (mii_dump / 'ExeFS').is_dir() and app != 0x0100000000001009 and romfs_mode != 'separate':
+    if mii_dump and (mii_dump / 'ExeFS').is_dir() and app != 0x0100000000001009:
         mii_idx = (max(programs.keys()) + 1) if programs else 1
         mii_work = work / 'miiedit_ios'
         say(f'==== program {mii_idx} (MiiEdit 0100000000001009)')
@@ -4233,7 +4234,6 @@ def _main(args, cleanup):
         miiedit_prog_idx = mii_idx
     else:
         miiedit_prog_idx = None
-    if programs and romfs_mode == 'separate': raise BuildError('a game of several programs keeps its files in the app (ROMFS / --romfs bundle): Documents holds one RomFS image, one program\'s')
     if not prepare_xcode and free_gb(out_ipa.parent) < 5: raise BuildError(f'less than 5 GB free on the volume of {out_ipa.parent}')
     say('preparing the Xcode project' if prepare_xcode else f'building the IPA → {out_ipa}')
     ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(romfs), MSL_IOS=str(ios), GFXAPI=gfx, DM_PYTHON=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''), DM_XCODE_DERIVED_DATA=str(work / 'xcode-derived-data'), DM_TEAM_ID=team_id, DM_LANG=lang, CONTROL=str(control))

@@ -58,10 +58,11 @@ static NSArray<NSString *> *romfs_document_images(NSString *doc) {
 static NSString *romfs_locate(NSString *prog) {   // prog: a game of several programs, the running program's folder in the app (p<N>); nil otherwise
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
-    if (prog) {   // the program's files are in the app (Documents holds one image, one program's)
+    if (prog) {   // the program's files are in the app (Documents holds one image, one program's); program 0 falls back to Documents/romfs.img when DM_COPY_ROMFS=NO
         NSString *p = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:prog], *img = [p stringByAppendingPathComponent:@"romfs.img"], *d = [p stringByAppendingPathComponent:@"romfs"];
         if (romfs_image_complete(img)) return img;
-        return [fm fileExistsAtPath:[d stringByAppendingPathComponent:@(DM_GAME_ROMFS_MARKER)]] ? d : nil;
+        if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@(DM_GAME_ROMFS_MARKER)]]) return d;
+        if (![prog isEqualToString:@"p0"]) return nil;
     }
     for (NSString *img in romfs_document_images(doc)) {
         if (!romfs_image_complete(img) || !romfs_identity_accepts(img)) continue;
