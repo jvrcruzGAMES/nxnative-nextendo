@@ -4008,17 +4008,6 @@ def _main(args, cleanup):
         run(['dotnet', 'run', '--project', str(repo / 'dm/tools/fw_extract/fw_extract.csproj'), '--', str(keys), str(fw_path), str(fw_sys)], fw_log, env=env)
         PROG.end(f'{fw_path.name}')
         say(f'firmware system data: extracted to {fw_sys}')
-        bntx_icon = fw_sys / 'applets/0100000000001009/RomFS/lyt/Texture/IconAll.bntx'
-        if bntx_icon.is_file():
-            mii_icons_dir = fw_sys / 'mii_icons'
-            try:
-                run([py, str(repo / 'dm/tools/extract_mii_icons.py'), str(bntx_icon), str(mii_icons_dir)], fw_log, env=env)
-                bntx_base = fw_sys / 'applets/0100000000001009/RomFS/lyt/Texture/IconEditBaseAll.bntx'
-                if bntx_base.is_file():
-                    run([py, str(repo / 'dm/tools/extract_mii_icons.py'), str(bntx_base), str(mii_icons_dir)], fw_log, env=env)
-                say(f'Mii editor 2D icons: extracted {len(list(mii_icons_dir.glob("*.png")))} icons to {mii_icons_dir}')
-            except Exception as e:
-                say(f'[WARN] failed to extract Mii icons: {e}')
 
     picks = pick_nsps(fam, have, versions)
     nup_label = pack_nup.display_label(picks[pkg_ver][1] or picks[pkg_ver][0]) if nup else ''
@@ -4223,6 +4212,27 @@ def _main(args, cleanup):
     if getattr(args, 'in_programs', None) is not None:   # a program of the game: the app its first program's build packs takes these
         rmtree(work / 'tmp'); return {'row': (PROGRAM_INDEX, g.id, patched, romfs, ios, gfx), 'ex': ex, 'keep': keep}
     programs = other_programs(args, g)
+    mii_dump = fw_sys / 'applets/0100000000001009' if fw_sys else None
+    if mii_dump and (mii_dump / 'ExeFS').is_dir() and app != 0x0100000000001009 and romfs_mode != 'separate':
+        mii_idx = (max(programs.keys()) + 1) if programs else 1
+        mii_work = work / 'miiedit_ios'
+        say(f'==== program {mii_idx} (MiiEdit 0100000000001009)')
+        sub = types.SimpleNamespace(**vars(args))
+        sub.dump = str(mii_dump)
+        sub.work = str(mii_work)
+        sub.program = 0
+        sub.in_programs = {}
+        sub.firmware = None
+        sub.no_heap_check = True
+        sub.glslc_play = None
+        mii_res = main(sub)
+        PROGRAM_INDEX = 0
+        programs[mii_idx] = {'row': (mii_idx,) + tuple(mii_res['row'][1:])}
+        ipa_env_extra_games = str(mii_work / 'profile')
+        os.environ['DM_GAMES_DIR'] = env['DM_GAMES_DIR'] = os.pathsep.join([d for d in [os.environ.get('DM_GAMES_DIR', ''), ipa_env_extra_games] if d])
+        miiedit_prog_idx = mii_idx
+    else:
+        miiedit_prog_idx = None
     if programs and romfs_mode == 'separate': raise BuildError('a game of several programs keeps its files in the app (ROMFS / --romfs bundle): Documents holds one RomFS image, one program\'s')
     if not prepare_xcode and free_gb(out_ipa.parent) < 5: raise BuildError(f'less than 5 GB free on the volume of {out_ipa.parent}')
     say('preparing the Xcode project' if prepare_xcode else f'building the IPA → {out_ipa}')
@@ -4254,6 +4264,7 @@ def _main(args, cleanup):
     if show_fps: say('frame-rate counter: on (DM_SHOW_FPS=0 in the app\'s Documents/env.txt turns it off)')
     if programs:   # one app holding every program of the game (build_ipa.sh PROGRAMS_TSV)
         tsv = work / 'ipa_programs.tsv'; ipa_env['PROGRAMS_TSV'] = str(tsv)
+        if miiedit_prog_idx is not None: ipa_env['DM_MIIEDIT_PROGRAM'] = str(miiedit_prog_idx)
         rows = [(0, g.id, patched, romfs, ios, gfx)] + [programs[n]['row'] for n in sorted(programs)]
         tsv.write_text('# program\tprofile\trewritten modules\tRomFS\tiOS shaders\tgraphics API (build_ipa.sh PROGRAMS_TSV)\n' + ''.join('\t'.join(map(str, r)) + '\n' for r in rows))
         say(f'one app holding programs {", ".join(str(r[0]) for r in rows)}')

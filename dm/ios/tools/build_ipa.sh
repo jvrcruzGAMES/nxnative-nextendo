@@ -144,6 +144,7 @@ if [ -n "${PROGRAMS_TSV:-}" ]; then
   : > Gen/dm/programs.txt
   while IFS= read -r row; do prog_set "$row"; TD=Gen/dm/p$PN; mkdir -p "$TD" || die "mkdir $TD"; VNACP=$(dirname "$ROMFS")/control.nacp; [ "$PN" != 0 ] || VNACP=${CONTROL:-$VNACP}; program_tables; echo "$PN" >> Gen/dm/programs.txt; done < <(prog_rows)
   prog_back
+  if [ -n "${DM_MIIEDIT_PROGRAM:-}" ]; then printf '%s\n' "$DM_MIIEDIT_PROGRAM" > Gen/dm/miiedit_program.txt; fi
   LJ=Gen/dm/p0/launcher.json
 else TD=Gen/dm; program_tables; LJ=Gen/dm/launcher.json; fi
 # The pipeline archive made offline (dm/gfx/tools/pso_offline.py): the base of every shader pair and a pipeline per compute shader of the shader map, compiled here by metal-tt for each GPU architecture in DM_PSO_GPUS (comma-separated:

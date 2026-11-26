@@ -621,12 +621,46 @@ void front_error_dialog(const char *code, const char *msg) {
     dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
 }
 
-// Native Mii editor (front.h): full-screen SwiftUI Mii Creator with 3D rendering and 2D firmware assets
+// MiiEdit applet (front.h): on iOS, if MiiEdit (0100000000001009) is bundled as an app program (DM_MIIEDIT_PROGRAM),
+// record the return program + mode and hand off via DM_EXEC_OUT + front_program_handoff. Without firmware, return -1.
 int front_mii_editor_last_index(void) { return -1; }
 int front_mii_editor(void *charinfo_out, int is_new) {
+    (void)charinfo_out;
     if (!g_layer) return -1;
-    extern int dm_show_mii_editor(void *charinfo_out, int is_new);
-    return dm_show_mii_editor(charinfo_out, is_new);
+    const char *mii_prog_env = getenv("DM_MIIEDIT_PROGRAM");
+    const char *exec_out = getenv("DM_EXEC_OUT");
+    const char *ret_path = getenv("DM_MIIEDIT_RETURN");
+    if (!mii_prog_env || !*mii_prog_env || !exec_out || !*exec_out || !ret_path || !*ret_path) {
+        return -1;
+    }
+    int32_t mii_prog = (int32_t)atoi(mii_prog_env);
+    int32_t cur_prog = getenv("DM_PROGRAM") ? (int32_t)atoi(getenv("DM_PROGRAM")) : 0;
+    FILE *rfp = fopen(ret_path, "wb");
+    if (!rfp || fwrite(&cur_prog, 4, 1, rfp) != 1) {
+        if (rfp) fclose(rfp);
+        return -1;
+    }
+    fclose(rfp);
+
+    const char *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0].fileSystemRepresentation;
+    char mode_path[1024];
+    snprintf(mode_path, sizeof mode_path, "%s/miiedit_mode.txt", doc);
+    FILE *mfp = fopen(mode_path, "w");
+    if (mfp) { fprintf(mfp, "%d\n", is_new ? 1 : 0); fclose(mfp); }
+
+    FILE *efp = fopen(exec_out, "wb");
+    if (!efp || fwrite(&mii_prog, 4, 1, efp) != 1) {
+        if (efp) fclose(efp);
+        unlink(ret_path);
+        return -1;
+    }
+    fclose(efp);
+
+    void dm_gfx_quit_begin(void);
+    dm_gfx_quit_begin();
+    front_program_handoff(mii_prog, "Mii Maker");
+    exit(0);
+    return -1;
 }
 
 #if 0

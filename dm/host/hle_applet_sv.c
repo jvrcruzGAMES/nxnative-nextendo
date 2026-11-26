@@ -348,6 +348,22 @@ static Result library_applet_self_accessor_answer(sf_req *q) {
     }
     if (q->cmd == 10) { // ExitProcessAndReturn
         LOG("sf: ILibraryAppletSelfAccessor ExitProcessAndReturn: applet requested exit");
+        const char *ret_path = getenv("DM_MIIEDIT_RETURN");
+        const char *exec_out = getenv("DM_EXEC_OUT");
+        if (ret_path && *ret_path && exec_out && *exec_out) {
+            FILE *rfp = fopen(ret_path, "rb");
+            int32_t ret_prog = 0;
+            int has_ret = (rfp && fread(&ret_prog, 4, 1, rfp) == 1);
+            if (rfp) fclose(rfp);
+            if (has_ret) {
+                unlink(ret_path);
+                FILE *efp = fopen(exec_out, "wb");
+                if (efp) { fwrite(&ret_prog, 4, 1, efp); fclose(efp); }
+                void dm_gfx_quit_begin(void);
+                dm_gfx_quit_begin();
+                front_program_handoff(ret_prog, "Game");
+            }
+        }
         exit(0);
         return RES_OK;
     }

@@ -299,6 +299,20 @@ static NSString *program_env(void) {
         setenv("DM_PROGRAM", [NSString stringWithFormat:@"%d", n].UTF8String, 1);
         setenv("DM_EMBED_TAG", prog.UTF8String, 1);
         setenv("DM_EXEC_OUT", rec.fileSystemRepresentation, 0);
+        NSString *miiProgStr = [NSString stringWithContentsOfFile:[dmdir stringByAppendingPathComponent:@"miiedit_program.txt"] encoding:NSUTF8StringEncoding error:nil];
+        if (miiProgStr) {
+            int miiIdx = atoi([miiProgStr stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].UTF8String);
+            setenv("DM_MIIEDIT_PROGRAM", [NSString stringWithFormat:@"%d", miiIdx].UTF8String, 1);
+            setenv("DM_MIIEDIT_RETURN", [doc stringByAppendingPathComponent:@"miiedit_return.bin"].fileSystemRepresentation, 1);
+            NSString *modePath = [doc stringByAppendingPathComponent:@"miiedit_mode.txt"];
+            if (n == miiIdx) {
+                NSString *modeStr = [NSString stringWithContentsOfFile:modePath encoding:NSUTF8StringEncoding error:nil];
+                if (modeStr) {
+                    setenv("DM_MIIEDIT_MODE", [modeStr stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].UTF8String, 1);
+                }
+            }
+            [fm removeItemAtPath:modePath error:nil];
+        }
         dmdir = [dmdir stringByAppendingPathComponent:prog];
         setenv("DM_APP_DM", dmdir.fileSystemRepresentation, 1);   // the launcher's settings (Launcher.swift)
         fprintf(stderr, "boot: program %d of %s (%zu bytes of launch parameter)\n", n, [[plist stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] stringByReplacingOccurrencesOfString:@"\n" withString:@" "].UTF8String, d.length > 4 ? (size_t)d.length - 4 : 0);
