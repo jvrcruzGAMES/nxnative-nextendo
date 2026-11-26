@@ -58,10 +58,12 @@ static NSArray<NSString *> *romfs_document_images(NSString *doc) {
 static NSString *romfs_locate(NSString *prog) {   // prog: a game of several programs, the running program's folder in the app (p<N>); nil otherwise
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
-    if (prog) {   // the program's files are in the app (Documents holds one image, one program's); program 0 falls back to Documents/romfs.img when DM_COPY_ROMFS=NO
-        NSString *p = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:prog], *img = [p stringByAppendingPathComponent:@"romfs.img"], *d = [p stringByAppendingPathComponent:@"romfs"];
-        if (romfs_image_complete(img)) return img;
-        if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@(DM_GAME_ROMFS_MARKER)]]) return d;
+    if (prog) {   // multi-program app (or MiiEdit applet): check Documents/p<N>/ first, then <App>/p<N>/; program 0 also falls back to Documents/romfs.img
+        for (NSString *root in @[doc, NSBundle.mainBundle.resourcePath]) {
+            NSString *p = [root stringByAppendingPathComponent:prog], *img = [p stringByAppendingPathComponent:@"romfs.img"], *d = [p stringByAppendingPathComponent:@"romfs"];
+            if (romfs_image_complete(img)) return img;
+            if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@(DM_GAME_ROMFS_MARKER)]]) return d;
+        }
         if (![prog isEqualToString:@"p0"]) return nil;
     }
     for (NSString *img in romfs_document_images(doc)) {
@@ -162,7 +164,7 @@ static int boot_env(void) {
     NSString *res = NSBundle.mainBundle.resourcePath;
     for (NSString *d in @[@"save", @"temp"]) [fm createDirectoryAtPath:[doc stringByAppendingPathComponent:d] withIntermediateDirectories:YES attributes:nil error:nil];
     // Keep game files and scratch data out of device backups (Documents is backed up by default; a RomFS placed there is many GB). Saves, logs and the pipeline list stay in the backup
-    for (NSString *d in [@[@"romfs", @"aoc", @"msl", @"pso", @"romfs_programs", @"html", @"jit", @"temp"] arrayByAddingObjectsFromArray:[romfs_document_images(doc) valueForKey:@"lastPathComponent"]]) {
+    for (NSString *d in [@[@"romfs", @"aoc", @"msl", @"pso", @"romfs_programs", @"html", @"jit", @"system", @"p0", @"p1", @"p2", @"p3", @"temp"] arrayByAddingObjectsFromArray:[romfs_document_images(doc) valueForKey:@"lastPathComponent"]]) {
         NSURL *u = [NSURL fileURLWithPath:[doc stringByAppendingPathComponent:d]]; NSError *e = nil;
         if ([fm fileExistsAtPath:u.path] && ![u setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:&e]) fprintf(stderr, "boot: %s could not be excluded from backup: %s\n", d.UTF8String, e.localizedDescription.UTF8String);
     }

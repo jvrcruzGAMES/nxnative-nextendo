@@ -202,7 +202,7 @@ else
     || die "make_shared_fonts.py (pip install fonttools, or FONT_PY=python with fontTools; STD_FONT=a TTF)"
 fi
 # System data (e.g. from Firmware.zip: MiiModel 0100000000000802, etc.)
-if [ -d "${SYSTEM_DIR:-}" ]; then
+if [ "$DM_NXSHARE" != YES ] && [ -d "${SYSTEM_DIR:-}" ]; then
   mkdir -p Gen/dm/system && cp -R "$SYSTEM_DIR"/* Gen/dm/system/ || die "copy SYSTEM_DIR"
   t "system data: from $SYSTEM_DIR"
 fi
@@ -280,7 +280,35 @@ fi
 P=Payload/DmIOS.app
 SKIP=(--skip $P/_CodeSignature --skip $P/embedded.mobileprovision --skip $P/msl --skip $P/aoc --skip $P/romfs --skip $P/romfs.img --skip $P/romfs.id --skip $P/html --skip $P/jit --skip $P/romfs_programs)
 if [ -n "${PROGRAMS_TSV:-}" ]; then   # each program's shader libraries, RomFS, offline HTML pages and nn::jit image under its own folder
-  if [ "$DM_NXSHARE" = YES ]; then DM_COPY_ROMFS=NO; fi
+  if [ "$DM_NXSHARE" = YES ]; then
+    DM_COPY_ROMFS=NO
+    MAPS=("$P=$APP")
+    mkdir -p "$O"
+    : > "$O/nxshare_programs.tsv"
+    while IFS= read -r row; do prog_set "$row"; SKIP+=(--skip "$P/p$PN")
+      if [ "$PN" = 0 ] && [ -f "$ROMFS" ]; then
+        "${DM_PYTHON:-python3}" -I "$DM/tools/romfs_image.py" --identity "$ROMFS" "$GAME" "$DM_APP_VERSION" "${PKG:-}" > "$O/romfs.id" || die "identity of $ROMFS"
+        MAPS+=("$P/romfs.id=$O/romfs.id"); t "game files identity: $(cat "$O/romfs.id")"
+      fi
+      GLP=; [ "$GFXAPI" = nvn ] && [ -s "$GD/gl_capture.tsv" ] && GLP=$MSL_IOS/gl
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$PN" "$GFXAPI" "$MSLDIR" "$(lib_path "$MSL_IOS/$MSLDIR")" "$ROMFS" "$GLP" >> "$O/nxshare_programs.tsv"
+    done < <(prog_rows); prog_back
+    "${DM_PYTHON:-python3}" -c '
+import json, sys
+progs = []
+for line in open(sys.argv[1]):
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) < 6: continue
+    progs.append({"index": int(parts[0]), "gfxApi": parts[1], "mslDir": parts[2], "mslPath": parts[3], "romfs": parts[4], "glPath": parts[5]})
+info = {
+    "titleId": sys.argv[2], "name": sys.argv[3], "version": sys.argv[4], "bundleId": sys.argv[5],
+    "gfxApi": sys.argv[6], "mslDir": sys.argv[7], "mslPath": sys.argv[8],
+    "romfs": sys.argv[9], "aoc": sys.argv[10], "pso": sys.argv[11], "systemDir": sys.argv[12],
+    "programs": progs,
+}
+with open(sys.argv[13], "w") as f: json.dump(info, f, indent=2)
+' "$O/nxshare_programs.tsv" "$GAME" "$DM_DISPLAY_NAME" "$DM_APP_VERSION" "$DM_BUNDLE_ID" "$GFXAPI" "$MSLDIR" "$(lib_path "$MSL_IOS/$MSLDIR")" "$ROMFS" "${AOC:-}" "${PSO:-}" "${SYSTEM_DIR:-}" "$O/nxshare_info.json" || die "nxshare_info.json"
+  else
   if [ "${DM_COPY_ROMFS:-YES}" = NO ]; then
     [ -n "${DM_MIIEDIT_PROGRAM:-}" ] && [ "$(prog_rows | wc -l | tr -d ' ')" -le 2 ] \
       || die "DM_COPY_ROMFS=NO: a game of several programs keeps its programs' files in the app"
@@ -301,6 +329,7 @@ if [ -n "${PROGRAMS_TSV:-}" ]; then   # each program's shader libraries, RomFS, 
     if [ -d "$(dirname "$ROMFS")/jit" ]; then MAPS+=("$P/p$PN/jit=$(dirname "$ROMFS")/jit"); t "program $PN: nn::jit image $(dirname "$ROMFS")/jit"; fi   # beside its RomFS (loader.c dm_jit_serve_dir)
     if [ -d "$(dirname "$ROMFS")/romfs_programs" ]; then MAPS+=("$P/p$PN/romfs_programs=$(dirname "$ROMFS")/romfs_programs"); fi   # the other programs' RomFS (hle_fs.c MountRom by program index)
   done < <(prog_rows); prog_back
+  fi
 else
 MAPS=()
 if [ "$DM_NXSHARE" = YES ]; then
@@ -323,10 +352,10 @@ import json, sys
 info = {
     "titleId": sys.argv[1], "name": sys.argv[2], "version": sys.argv[3], "bundleId": sys.argv[4],
     "gfxApi": sys.argv[5], "mslDir": sys.argv[6], "mslPath": sys.argv[7],
-    "romfs": sys.argv[8], "aoc": sys.argv[9], "pso": sys.argv[10],
+    "romfs": sys.argv[8], "aoc": sys.argv[9], "pso": sys.argv[10], "systemDir": sys.argv[11],
 }
-with open(sys.argv[11], "w") as f: json.dump(info, f, indent=2)
-' "$GAME" "$DM_DISPLAY_NAME" "$DM_APP_VERSION" "$DM_BUNDLE_ID" "$GFXAPI" "$MSLDIR" "$(lib_path "$MSL_IOS/$MSLDIR")" "$ROMFS" "${AOC:-}" "${PSO:-}" "$O/nxshare_info.json" || die "nxshare_info.json"
+with open(sys.argv[12], "w") as f: json.dump(info, f, indent=2)
+' "$GAME" "$DM_DISPLAY_NAME" "$DM_APP_VERSION" "$DM_BUNDLE_ID" "$GFXAPI" "$MSLDIR" "$(lib_path "$MSL_IOS/$MSLDIR")" "$ROMFS" "${AOC:-}" "${PSO:-}" "${SYSTEM_DIR:-}" "$O/nxshare_info.json" || die "nxshare_info.json"
 else
 if [ -n "$AOC" ] && [ -d "$AOC" ]; then MAPS+=("$P/aoc=$AOC"); t "add-on content: $(ls "$AOC" | tr '\n' ' ')"; fi
 if [ -n "${PSO:-}" ]; then MAPS+=("$P/pso=$PSO"); fi

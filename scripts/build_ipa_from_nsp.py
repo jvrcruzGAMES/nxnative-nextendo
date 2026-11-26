@@ -3659,27 +3659,50 @@ def pack_nxshare_zip(out_zip, slim_ipa, info_path, romfs_path, icon, aoc, say, n
                 if p.is_file() and not p.name.startswith('._') and p.name != '.DS_Store':
                     doc_entries.append((p, f'{dst_rel}/{p.relative_to(src).as_posix()}'))
 
-    if romfs_path.is_file():
-        doc_entries.append((romfs_path, 'romfs.img'))
-    elif romfs_path.is_dir():
-        add_tree(romfs_path, 'romfs')
-
-    msl_path = Path(info['mslPath'])
     msl_dir = info['mslDir']
-    if msl_path.is_file():
-        doc_entries.append((msl_path, f'msl/{msl_path.name}'))
-    elif msl_path.is_dir():
-        add_tree(msl_path, f'msl/{msl_dir}')
+    if info.get('programs'):
+        for p in info['programs']:
+            pn = p['index']
+            pr = Path(p['romfs'])
+            if pr.is_file():
+                doc_entries.append((pr, f'p{pn}/romfs.img'))
+            elif pr.is_dir():
+                add_tree(pr, f'p{pn}/romfs')
+            pm = Path(p['mslPath'])
+            pmd = p['mslDir']
+            if pm.is_file():
+                doc_entries.append((pm, f'msl/p{pn}/{pm.name}'))
+            elif pm.is_dir():
+                add_tree(pm, f'msl/p{pn}/{pmd}')
+            if p.get('glPath') and Path(p['glPath']).is_dir():
+                add_tree(Path(p['glPath']), f'msl/p{pn}/gl')
+            for extra in ('html', 'jit', 'romfs_programs'):
+                if (pr.parent / extra).is_dir():
+                    add_tree(pr.parent / extra, f'p{pn}/{extra}')
+    else:
+        if romfs_path.is_file():
+            doc_entries.append((romfs_path, 'romfs.img'))
+        elif romfs_path.is_dir():
+            add_tree(romfs_path, 'romfs')
+
+        msl_path = Path(info['mslPath'])
+        msl_dir = info['mslDir']
+        if msl_path.is_file():
+            doc_entries.append((msl_path, f'msl/{msl_path.name}'))
+        elif msl_path.is_dir():
+            add_tree(msl_path, f'msl/{msl_dir}')
+
+        rom_parent = romfs_path.parent
+        for extra in ('html', 'jit', 'romfs_programs'):
+            if (rom_parent / extra).is_dir():
+                add_tree(rom_parent / extra, extra)
 
     if aoc and Path(aoc).is_dir():
         add_tree(Path(aoc), 'aoc')
     if info.get('pso') and Path(info['pso']).is_dir():
         add_tree(Path(info['pso']), 'pso')
-
-    rom_parent = romfs_path.parent
-    for extra in ('html', 'jit', 'romfs_programs'):
-        if (rom_parent / extra).is_dir():
-            add_tree(rom_parent / extra, extra)
+    if info.get('systemDir') and Path(info['systemDir']).is_dir():
+        add_tree(Path(info['systemDir']), 'system')
 
     files_meta = [{'path': rel, 'size': src.stat().st_size} for src, rel in doc_entries]
     doc_total = sum(f['size'] for f in files_meta)
